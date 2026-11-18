@@ -414,7 +414,7 @@ Agent 会话按宿主契约注册以下工具（作用域绑定到当前 Agent�
 `client.js` 通过 `window.__ModuleLoader__.load` 注册模块，模块 id 为：
 
 ```text
-@cubeai/dsh-feishu-channels
+@waves_man/dsh-feishu-channels
 ```
 
 ### 8.1 侧边栏页签

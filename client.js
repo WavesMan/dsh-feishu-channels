@@ -2,7 +2,7 @@
  * dsh-feishu-channels 浏览器端：飞书频道设置页 + 工作区频道槽。
  */
 window.__ModuleLoader__.load({
-  id: "@cubeai/dsh-feishu-channels",
+  id: "@waves_man/dsh-feishu-channels",
   factory: (require) => {
     var module = { exports: {} };
     var exports = module.exports;
@@ -954,11 +954,11 @@ window.__ModuleLoader__.load({
     let styleEl = null;
     const ensureStyle = () => {
       if (styleEl && styleEl.isConnected) {
-        styleEl.setAttribute("data-plugin", "@cubeai/dsh-feishu-channels");
+        styleEl.setAttribute("data-plugin", "@waves_man/dsh-feishu-channels");
         return;
       }
       styleEl = document.createElement("style");
-      styleEl.setAttribute("data-plugin", "@cubeai/dsh-feishu-channels");
+      styleEl.setAttribute("data-plugin", "@waves_man/dsh-feishu-channels");
       styleEl.textContent = CSS + TITLE_LINK_CSS;
       document.head.appendChild(styleEl);
     };

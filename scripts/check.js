@@ -26,7 +26,7 @@ function walk(dir, out = []) {
 }
 
 const pkg = JSON.parse(read('package.json'))
-if (pkg.name !== '@cubeai/dsh-feishu-channels') fail(`package name is ${pkg.name}`)
+if (pkg.name !== '@waves_man/dsh-feishu-channels') fail(`package name is ${pkg.name}`)
 if (pkg.type !== 'module') fail('package must be ESM')
 if (pkg.main !== 'src/index.js') fail(`main is ${pkg.main}`)
 if (pkg.exports?.['.'] !== './src/index.js') fail('exports["."] must point at src/index.js')
@@ -56,7 +56,7 @@ if (!read('src/engine/session-id.js').includes("DFC_SESSION_PREFIX = 'dfc:'")) f
 if (!read('src/engine/credentials.js').includes('dfc_${channelId}_${key}')) fail('credential ref prefix must be dfc_')
 if (!read('src/manager.js').includes("'/api/dsh-feishu-channels'")) fail('manager API prefix must be /api/dsh-feishu-channels')
 if (!read('src/manager.js').includes("'x-dsh-feishu-channels-client'")) fail('manager mutation header must be x-dsh-feishu-channels-client')
-if (!read('client.js').includes('id: "@cubeai/dsh-feishu-channels"')) fail('client module id mismatch')
+if (!read('client.js').includes('id: "@waves_man/dsh-feishu-channels"')) fail('client module id mismatch')
 if (!read('client.js').includes('"/api/dsh-feishu-channels"')) fail('client API base mismatch')
 if (!read('client.js').includes('"feishu-channel"')) fail('client locale namespace mismatch')
 

@@ -103,9 +103,11 @@ src/index.js
 
 - 用 App ID/App Secret 建立 WebSocket 长连接；
 - 接收私聊、群聊 @、图片、文件、富文本等事件；
-- 将飞书消息规范化为引擎事件；
-- 把文本、卡片、图片、文件回复发送到飞书；
-- 暴露连接状态和诊断信息。
+- 保留 `message_id`、`parent_id`、`root_id`、`thread_id`、mentions、链接与附件描述，事件与 API 查询结果先统一结构；
+- 自动读取一层直接引用（只有 `root_id` 时标记为根消息），读取失败只记录原因，不丢弃当前请求；
+- 图片、文件在接收阶段只解析清单，下载落盘由引擎按当前会话工作区完成；
+- 把文本卡片、图片和文件回复发送到飞书，文字与文件共用同一个触发消息作为回复目标；
+- 暴露连接状态和诊断信息（含历史与资源 scope 核对）。
 
 ### 3.4 ImEngine
 
@@ -117,7 +119,9 @@ src/index.js
 - 审批、提问、选择按钮和命令处理；
 - 流式回复、分片、失败重试和延迟投递；
 - 私聊准入和群聊 @ 规则；
-- 文件和图片输入输出；
+- 消息来源合并与按来源分块提交；
+- 附件工作区落盘、历史附件下载工具与消息上下文读取工具；
+- 显式文件交付：图片走图片消息，普通文件走文件消息，同一回合去重；
 - 会话标题、历史恢复和工作区挂载。
 
 Host 通过 `ctx` 使用这些宿主服务：
@@ -147,6 +151,7 @@ $DSH_HOME/dsh-feishu-channels
 | `sessions.json` | `dfc:` 会话映射 |
 | `seen.json` | 消息去重记录 |
 | `deferred-delivery.json` | 发送失败后的延迟投递状态 |
+| `file-delivery.json` | 最近的文件交付结果（已发送 / 平台拒绝 / 结果未知） |
 | `gateway.log` | 插件运行日志（滚动文件） |
 | `secrets.json` | 仅当 Host 没有 credentials 服务时的本地凭据回退文件 |
 
@@ -307,29 +312,59 @@ content-type: application/json
 
 ```text
 飞书 WebSocket 事件
-  → FeishuChannelAdapter 解析
+  → FeishuChannelAdapter 解析（统一消息结构、保留引用关系）
+  → 自动读取一层直接引用
   → ImEngine
       → 去重（seen.json）
       → 私聊准入 / 群聊 @ 判定
       → 斜杠命令或普通消息
+      → 绑定会话工作区 → 附件下载落盘
+      → 按来源组装正文（正文 / 引用 / 附件路径）
       → SessionMerger / SessionRouter
-      → DSH Agent
-      → 流式回复 / 审批 / 提问 / 文件
-  → FeishuChannelAdapter 发送
+      → DSH Agent（可按需调用上下文与附件下载工具）
+      → 流式回复 / 审批 / 提问 / 文件与图片
+  → FeishuChannelAdapter 发送（关联触发消息）
   → 成功后记录投递状态
 ```
+
+附件目录：
+
+```text
+<当前会话工作区>/.feishu/attachments/
+  <来源消息ID>/
+    <附件唯一ID>/
+      项目需求.docx
+  records.json
+```
+
+`records.json` 记录附件 ID、频道、聊天、来源消息、原文件名、相对路径、字节数、下载状态和下载时间。文件名会清理路径分隔符与控制字符；同名文件按来源和附件目录隔离；先写临时文件，完整下载后再改名。
 
 ### 6.3 出站与失败处理
 
 - 文本按飞书消息大小限制分片；
 - Markdown 优先使用卡片；卡片不可用或发送失败时回退纯文本；
-- 图片、文件通过飞书上传接口发送；
+- 图片按图片消息发送，普通文档按文件消息发送；图片超过平台限制或上传被拒时改按文件发送；
+- 有明确触发消息时使用回复接口关联来源，合并输入以最后一条触发消息为目标；
+- 文件交付优先复用宿主 `present` 工具与 `deliverables/presented` 事件；同一回合同一文件只发送一次；
+- 平台明确拒绝与超时/断连分开记录；结果未知时不自动重试，避免重复发送；
 - 处理中可显示状态表情；
 - 发送失败按分片退避重试；
 - 明确失败或超时可能进入 `deferred-delivery.json`，由后台恢复逻辑重试；
 - Agent 运行期间的用户问题/工具审批会转成飞书卡片或文本交互，结果再回填 DSH。
 
-### 6.4 访问控制与命令
+### 6.4 上下文与附件工具
+
+Agent 会话按宿主契约注册以下工具（作用域绑定到当前 Agent）：
+
+| 工具 | 作用 |
+|---|---|
+| `feishu_read_context` | 按 `message` / `thread` / `recent` 读取当前聊天内的消息；返回正文、作者、时间、引用关系、附件清单与分页/截断状态 |
+| `feishu_download_attachment` | 把当前请求可访问的附件下载到工作区，返回真实相对路径；失败只返回原因 |
+| `feishu_deliver_file` | 宿主没有 `present` 工具时的薄适配：把工作区文件作为图片或文件消息发送 |
+
+读取范围绑定当前频道、聊天与触发请求：模型不能指定其他聊天，附件 ID 必须来自当前请求可访问的消息清单。工具结果直接在本次调用中返回，不会重新提交用户消息。
+
+### 6.5 访问控制与命令
 
 - 私聊准入支持 `approved` 和 `all`；
 - 首个用户/owner 会加入允许列表；
@@ -353,6 +388,9 @@ content-type: application/json
 | Scope | 类型 | 用途 |
 |---|---|---|
 | `im:message` | tenant | 接收/发送消息 |
+| `im:message:readonly` | tenant | 读取引用与单条消息 |
+| `im:message.group_msg` | tenant | 读取群历史消息 |
+| `im:resource` | tenant | 下载消息中的图片与文件 |
 | `im:message.send_as_user` | user | 以用户身份发送消息 |
 | `application:application:patch` | tenant | 写入应用配置（名称、重定向 URL 等） |
 

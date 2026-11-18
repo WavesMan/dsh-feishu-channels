@@ -34,6 +34,13 @@ export function recoverTurn(events, requestId, skipInterimText = false) {
             return { turn: target, text: replies.join('\n\n'), kind: data?.reason?.kind ?? 'unknown' };
     }
 }
+/** 交付记录只保留来源标识，不保存正文；用于事后核对触发消息、话题与合并来源。 */
+function deliverySources(sources) {
+    return (Array.isArray(sources) ? sources : []).slice(0, 20).map(item => ({
+        messageId: String(item?.messageId ?? ''), userId: String(item?.userId ?? ''),
+        createTime: Number(item?.createTime) || 0, threadId: String(item?.threadId ?? ''),
+    })).filter(item => item.messageId);
+}
 export class DeferredDelivery {
     file;
     entries = [];
@@ -87,7 +94,11 @@ export class DeferredDelivery {
             this.entries = previous;
             throw new Error('Delivery journal full; inspect /delivery');
         }
-        this.entries.push({ id, sessionId, channelId, message: { chatId: message.chatId, userId: message.userId, kind: message.kind ?? 'dm', text: '', addressed: true }, createdAt: Date.now(), status: 'waiting', offset: 0 });
+        const sources = deliverySources(message.sources);
+        this.entries.push({ id, sessionId, channelId, message: { chatId: message.chatId, userId: message.userId, kind: message.kind ?? 'dm', text: '', addressed: true,
+                ...(typeof message.messageId === 'string' && message.messageId ? { messageId: message.messageId } : {}),
+                ...(typeof message.threadId === 'string' && message.threadId ? { threadId: message.threadId } : {}),
+                ...(sources.length ? { sources } : {}) }, createdAt: Date.now(), status: 'waiting', offset: 0 });
         try {
             this.flush();
         }

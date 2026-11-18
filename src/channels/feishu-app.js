@@ -9,11 +9,14 @@
 import { gzipSync } from 'node:zlib'
 
 export const FEISHU_APP_SCOPES = {
+  // `im:message:readonly` / `im:message.group_msg` 用于读取引用与群历史，
+  // `im:resource` 用于把消息里的图片、文件下载到工作区；缺任意一项时工具
+  // 只能返回明确的失败原因。
   // `application:application:patch` is required by the app-config OpenAPI
   // that writes redirect URLs. Without it Feishu returns 99991672 even for
   // an app updating itself. It is prefilled together with the user-requested
   // message scopes so a freshly QR-created app can configure itself.
-  tenant: ['im:message', 'application:application:patch'],
+  tenant: ['im:message', 'im:message:readonly', 'im:message.group_msg', 'im:resource', 'application:application:patch'],
   user: ['im:message.send_as_user'],
 }
 
@@ -29,6 +32,9 @@ export const FEISHU_REDIRECT_URLS = [
 
 const REQUESTED_SCOPES = [
   { scope_name: 'im:message', token_type: 'tenant' },
+  { scope_name: 'im:message:readonly', token_type: 'tenant' },
+  { scope_name: 'im:message.group_msg', token_type: 'tenant' },
+  { scope_name: 'im:resource', token_type: 'tenant' },
   { scope_name: 'im:message.send_as_user', token_type: 'user' },
 ]
 

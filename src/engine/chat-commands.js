@@ -146,7 +146,7 @@ export class ChatCommands {
             try {
                 // 原生渠道直接展示选择页，文字渠道沿用原列表及序号契约。
                 const list = /^\/(sessions|sessionlist|workspaces|workspacelist|models|presets|presetlist|reasoning|reasonings|reasoninglist)(?:\s+(\d+))?\s*$/i.exec(msg.text.trim());
-                if (list && !(list[1].toLowerCase().startsWith('reasoning') && list[2]) && channel.sendChoices && this.showChoices && !msg.media?.length) {
+                if (list && !(list[1].toLowerCase().startsWith('reasoning') && list[2]) && channel.sendChoices && this.showChoices && !msg.attachments?.length) {
                     const name = list[1].toLowerCase();
                     const section = name === 'sessionlist' ? 'sessions' : name === 'workspacelist' ? 'workspaces' : name === 'presetlist' ? 'presets' : name === 'reasonings' || name === 'reasoninglist' ? 'reasoning' : name;
                     // 尚无会话时 /models 仍可浏览目录，不把查询变成必须创建会话的操作。
@@ -224,7 +224,7 @@ export class ChatCommands {
         const input = match[2].trim();
         const kind = msg.kind === 'group' ? 'group' : 'dm';
         const scope = JSON.stringify([channel.id, kind, msg.chatId, msg.userId ?? '']);
-        if (msg.media?.length && ['preset', 'presets', 'presetlist', 'help', 'new', 'clear', 'sessions', 'sessionlist', 'session', 'unbind', 'mute', 'unmute', 'workspaces', 'workspacelist', 'workspace', 'models', 'status', 'current', 'stop', 'steer', 'rename', 'fork', 'model', 'reasoning', 'reasonings', 'reasoninglist', 'history', 'queue', 'export'].includes(command))
+        if (msg.attachments?.length && ['preset', 'presets', 'presetlist', 'help', 'new', 'clear', 'sessions', 'sessionlist', 'session', 'unbind', 'mute', 'unmute', 'workspaces', 'workspacelist', 'workspace', 'models', 'status', 'current', 'stop', 'steer', 'rename', 'fork', 'model', 'reasoning', 'reasonings', 'reasoninglist', 'history', 'queue', 'export'].includes(command))
             throw new Error(replyText('该控制命令不接受附件，请单独发送。'));
         const current = this.router.lookup(channel.id, kind, msg.chatId);
         const requireCurrent = () => { if (!current)
@@ -733,11 +733,8 @@ export class ChatCommands {
             return (history ? replyText('最近文字记录（不是完整历史）\n\n') + history : replyText('最近记录中没有可展示的文字，图片或文件请在网页查看。')) + related(replyText('继续此会话：直接发消息'), replyText('换一个会话：/sessions'), replyText('完整记录：在网页打开当前会话'));
         }
         const agent = await this.agent(sessionId);
-        const images = (msg.media || []).map((media) => {
-            if (media.kind !== 'image' || !media.data || !media.mediaType)
-                throw new Error(replyText('Chat 命令只支持文字和图片附件。'));
-            return { mediaType: media.mediaType, data: Buffer.from(media.data).toString('base64'), ...(media.name ? { name: media.name } : {}) };
-        });
+        // 飞书附件已保存为工作区文件，Chat 命令接口只接收文字；附件内容由 Agent 按路径读取。
+        const images = [];
         this.onSession(sessionId, msg);
         const result = await this.call('commands', 'execute', agent, msg.text.trim(), images, signal);
         let goal;

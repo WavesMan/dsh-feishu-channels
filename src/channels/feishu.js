@@ -1,13 +1,14 @@
 import { channelNotice } from '../engine/command-locale.js';
 import { choiceSendError, ChoiceSendError } from '../engine/choice-delivery.js';
 import { afterPartialDelivery, DeliveryRejected } from '../engine/deferred-delivery.js';
-import { diagnosticJson, platformResult, probe, requireDiagnostic } from './diagnostics.js';
+import { DiagnosticError, diagnosticJson, platformResult, probe, requireDiagnostic } from './diagnostics.js';
 import { fileOperation } from '../engine/abort.js';
 import { quietSdkLogger } from '../engine/quiet-logger.js';
 import { KeyedSerialQueue } from '../engine/keyed-queue.js';
 import { timeoutSignal } from '../engine/abort.js';
-import { fileMedia, MAX_CHANNEL_IMAGES } from './media.js';
 import { markdownTableOffsets } from '../engine/split.js';
+import { FileDeliveryError } from '../engine/file-delivery.js';
+import { normalizeFeishuMessage } from './feishu-message.js';
 /** 飞书一张卡片最多 5 个 table 元素，超了整个写入会被拒（230099 / ErrCode 11310），旧卡片内容会卡住。 */
 export const FEISHU_CARD_MAX_TABLES = 5;
 /** 按表格数量拆正文，保证每张卡不超上限，且不会把表格切一半。 */
@@ -49,110 +50,105 @@ function httpFailureSummary(error) {
 function isRejectedCode(code) {
     return code !== undefined && code !== 0 && code !== '0';
 }
-const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
-// Shared across all images in one message, not renewed for each resource.
-const MAX_MESSAGE_IMAGE_BYTES = MAX_IMAGE_BYTES;
-/** SDK messageResource.get is the receive-side API, not im.image.get. */
-export async function resolveFeishuContent(client, message, signal = AbortSignal.timeout(30_000)) {
-    const content = JSON.parse(message.content ?? '{}');
-    const keys = [];
-    const texts = [];
-    if (message.message_type === 'text')
-        texts.push(content.text ?? '');
-    else if (message.message_type === 'image') {
-        if (!content.image_key)
-            throw new Error('图片资源缺失');
-        keys.push(content.image_key);
-    }
-    else if (message.message_type === 'file') {
-        if (!content.file_key)
-            throw new Error('文件资源缺失');
-        keys.push(content.file_key);
-    }
-    else if (message.message_type === 'post') {
-        const post = content.content ? content : content.zh_cn ?? content.en_us ?? Object.values(content)[0];
-        if (!post || !Array.isArray(post.content))
-            throw new Error('富文本内容无效');
-        if (post.title)
-            texts.push(post.title);
-        for (const row of post.content) {
-            for (const item of row) {
-                if (item.tag === 'img') {
-                    if (!item.image_key)
-                        throw new Error('图片资源缺失');
-                    keys.push(item.image_key);
-                }
-                else if (typeof item.text === 'string')
-                    texts.push(item.text);
-            }
-        }
-    }
-    else
-        throw new Error('暂不支持该消息类型，请发送文字或图片。');
-    if (keys.length > MAX_CHANNEL_IMAGES)
-        throw new Error('图片数量超过上限');
-    const media = [];
-    let totalBytes = 0;
-    for (const key of keys) {
-        if (totalBytes >= MAX_MESSAGE_IMAGE_BYTES)
-            throw new Error('图片累计大小超过上限');
-        if (!message.message_id)
-            throw new Error('图片消息 ID 缺失');
-        signal.throwIfAborted();
-        let stream;
-        let abort = () => { };
-        const aborted = new Promise((_, reject) => {
-            abort = () => { stream?.destroy(new Error('图片下载已取消或超时')); reject(new Error('图片下载已取消或超时')); };
-            signal.addEventListener('abort', abort, { once: true });
-        });
-        try {
-            const resource = await Promise.race([
-                client.im.messageResource.get({ path: { message_id: message.message_id, file_key: key }, params: { type: message.message_type === 'file' ? 'file' : 'image' } }).then(resource => {
-                    stream = resource.getReadableStream();
-                    if (signal.aborted) {
-                        stream.destroy();
-                        throw new Error('图片下载已取消或超时');
-                    }
-                    return resource;
-                }), aborted,
-            ]);
-            const consume = async () => {
-                const chunks = [];
-                let size = 0;
-                if (Number(resource.headers?.['content-length']) > MAX_IMAGE_BYTES)
-                    throw new Error('图片超过 20 MB 上限');
-                if (Number(resource.headers?.['content-length']) > MAX_MESSAGE_IMAGE_BYTES - totalBytes)
-                    throw new Error('图片累计大小超过上限');
-                for await (const chunk of stream) {
-                    const bytes = Buffer.from(chunk);
-                    size += bytes.length;
-                    totalBytes += bytes.length;
-                    if (totalBytes > MAX_MESSAGE_IMAGE_BYTES)
-                        throw new Error('图片累计大小超过上限');
-                    if (size > MAX_IMAGE_BYTES)
-                        throw new Error('图片超过 20 MB 上限');
-                    chunks.push(bytes);
-                }
-                if (!size)
-                    throw new Error('图片为空');
-                if (message.message_type === 'file')
-                    return fileMedia(Buffer.concat(chunks), content.file_name);
-                return { kind: 'image', data: Buffer.concat(chunks), mediaType: resource.headers?.['content-type']?.split(';')[0] };
-            };
-            media.push(await Promise.race([consume(), aborted]));
-        }
-        finally {
-            signal.removeEventListener('abort', abort);
-            stream?.destroy();
-        }
-    }
-    return { text: texts.join('\n'), media };
-}
+/** 单条消息累计下载上限；与附件存储共用同一 20 MiB 预算。 */
+const MAX_RESOURCE_BYTES = 20 * 1024 * 1024;
+/** 飞书图片消息上传上限为 10 MB；超过时按普通文件发送。 */
+const MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024;
+const DEFAULT_PAGE_SIZE = 20;
+const MAX_PAGE_SIZE = 50;
+/** 读取引用或历史消息的时限；失败只记录原因，不影响当前请求。 */
+const CONTEXT_TIMEOUT_MS = 15_000;
 /** 群消息只有明确 mention 当前机器人本身才算 addressed；@ 其他成员不触发。 */
 export function isFeishuBotMentioned(mentions, botOpenId) {
     if (!botOpenId || !Array.isArray(mentions))
         return false;
     return mentions.some((mention) => mention.id?.open_id === botOpenId);
+}
+/** 引用读取失败只暴露稳定分类，不透传上游原文。 */
+function readFailureReason(error) {
+    if (error?.name === 'AbortError' || error?.name === 'TimeoutError')
+        return 'timeout';
+    const response = error?.response;
+    const code = Number(response?.data?.code ?? error?.platformCode);
+    const status = Number(response?.status);
+    if (code === 99991672 || status === 403)
+        return 'permission';
+    if (code === 230002 || status === 404)
+        return 'not-found';
+    if (isThrottleCode(code) || status === 429)
+        return 'throttled';
+    return 'unavailable';
+}
+/** 下载一个资源并按上限累计字节；返回完整 Buffer，失败不返回部分结果。 */
+async function readResource(client, { messageId, fileKey, type }, signal, limit = MAX_RESOURCE_BYTES) {
+    if (!messageId || !fileKey)
+        throw new Error('resource-missing');
+    let stream;
+    let abort = () => { };
+    const aborted = new Promise((_, reject) => {
+        abort = () => {
+            stream?.destroy(new Error('resource-aborted'));
+            reject(signal.reason ?? new Error('resource-aborted'));
+        };
+        signal.addEventListener('abort', abort, { once: true });
+    });
+    try {
+        const resource = await Promise.race([
+            client.im.messageResource.get({ path: { message_id: messageId, file_key: fileKey }, params: { type } }).then(value => {
+                stream = value.getReadableStream();
+                if (signal.aborted) {
+                    stream.destroy();
+                    throw signal.reason ?? new Error('resource-aborted');
+                }
+                return value;
+            }),
+            aborted,
+        ]);
+        const declared = Number(resource?.headers?.['content-length']);
+        if (Number.isFinite(declared) && declared > limit)
+            throw new Error('resource-too-large');
+        const chunks = [];
+        let size = 0;
+        for await (const chunk of stream) {
+            const bytes = Buffer.from(chunk);
+            size += bytes.length;
+            if (size > limit)
+                throw new Error('resource-too-large');
+            chunks.push(bytes);
+        }
+        if (size === 0)
+            throw new Error('resource-empty');
+        return Buffer.concat(chunks);
+    }
+    finally {
+        signal.removeEventListener('abort', abort);
+        stream?.destroy();
+    }
+}
+function messageItems(result) {
+    const data = result?.data;
+    const items = data?.items ?? (Array.isArray(data) ? data : data?.message ? [data.message] : []);
+    return Array.isArray(items) ? items : [];
+}
+function assertResult(result, stage) {
+    const code = result?.code;
+    if (isRejectedCode(code))
+        throw Object.assign(new Error(`${stage}-rejected`), { platformCode: Number(code) });
+    return result;
+}
+function deliveryFailure(error, stage) {
+    if (error instanceof FileDeliveryError)
+        return error;
+    if (error?.name === 'AbortError' || error?.name === 'TimeoutError')
+        return new FileDeliveryError('unknown', `${stage}-timeout`, { cause: error });
+    const response = error?.response;
+    const status = Number(response?.status);
+    const code = Number(response?.data?.code ?? error?.platformCode);
+    if (isThrottleCode(code) || status === 429)
+        return new FileDeliveryError('rejected', `${stage}-throttled`, { cause: error });
+    if (status >= 400 && status < 500)
+        return new FileDeliveryError('rejected', `${stage}-rejected`, { cause: error });
+    return new FileDeliveryError('unknown', `${stage}-unknown`, { cause: error });
 }
 export function createFeishuChannel(id, config, log, loadSdk) {
     const appId = config.appId?.trim();
@@ -165,6 +161,167 @@ export function createFeishuChannel(id, config, log, loadSdk) {
     let statusText = '未连接';
     let lifecycle;
     const label = '飞书';
+    /** 群/API 读取的单条消息；事件处理与工具共用。 */
+    async function readMessage(messageId, signal) {
+        if (!client)
+            throw new Error(`${id}: 尚未连接`);
+        const scope = AbortSignal.any([timeoutSignal(30_000, lifecycle?.signal), ...(signal ? [signal] : [])]);
+        scope.throwIfAborted();
+        const result = await fileOperation(client.im.message.get({ path: { message_id: messageId } }), scope);
+        assertResult(result, 'message-read');
+        const item = messageItems(result)[0];
+        if (!item)
+            throw Object.assign(new Error('message-not-found'), { platformCode: 230002 });
+        return normalizeFeishuMessage(item, { source: 'api' });
+    }
+    async function listMessages({ chatId, threadId, startTime, endTime, pageSize = DEFAULT_PAGE_SIZE, pageToken }, signal) {
+        if (!client)
+            throw new Error(`${id}: 尚未连接`);
+        if (!chatId)
+            throw new Error('message-list-scope-missing');
+        const scope = AbortSignal.any([timeoutSignal(30_000, lifecycle?.signal), ...(signal ? [signal] : [])]);
+        scope.throwIfAborted();
+        const size = Math.min(MAX_PAGE_SIZE, Math.max(1, Number.isSafeInteger(pageSize) ? pageSize : DEFAULT_PAGE_SIZE));
+        const result = await fileOperation(client.im.message.list({ params: {
+                container_id_type: threadId ? 'thread' : 'chat',
+                container_id: threadId || chatId,
+                sort_type: 'ByCreateTimeDesc',
+                page_size: String(size),
+                ...(startTime ? { start_time: String(startTime) } : {}),
+                ...(endTime ? { end_time: String(endTime) } : {}),
+                ...(pageToken ? { page_token: pageToken } : {}),
+            } }), scope);
+        assertResult(result, 'message-list');
+        const data = result?.data ?? {};
+        return {
+            messages: messageItems(result).map(item => normalizeFeishuMessage(item, { source: 'api' })),
+            hasMore: data.has_more === true || data.has_more === 1,
+            pageToken: typeof data.page_token === 'string' ? data.page_token : '',
+        };
+    }
+    async function downloadAttachment(attachment, signal, limit = MAX_RESOURCE_BYTES) {
+        if (!attachment?.sourceMessageId)
+            throw new Error('attachment-source-missing');
+        const key = attachment.kind === 'image' ? attachment.imageKey ?? attachment.fileKey : attachment.fileKey ?? attachment.imageKey;
+        const scope = AbortSignal.any([timeoutSignal(60_000, lifecycle?.signal), ...(signal ? [signal] : [])]);
+        scope.throwIfAborted();
+        return readResource(client, { messageId: attachment.sourceMessageId, fileKey: key, type: attachment.kind === 'image' ? 'image' : 'file' }, scope, limit);
+    }
+    function sendPayload(chatId, target, payload, sender = client) {
+        if (!sender)
+            throw new Error(`${id}: 尚未连接`);
+        if (target?.messageId) {
+            if (typeof sender.im.message.reply !== 'function')
+                throw new Error('reply-unsupported');
+            return sender.im.message.reply({ path: { message_id: target.messageId }, data: payload });
+        }
+        return sender.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: chatId, ...payload } });
+    }
+    async function sendFile(chatId, file, signal, target) {
+        if (!client || !lifecycle)
+            throw new Error(`${id}: 尚未连接`);
+        const active = client;
+        const scope = AbortSignal.any([timeoutSignal(120_000, lifecycle.signal), ...(signal ? [signal] : [])]);
+        scope.throwIfAborted();
+        let uploaded;
+        try {
+            uploaded = await fileOperation(active.im.file.create({ data: { file_type: 'stream', file_name: file.name, file: Buffer.from(file.data) } }), scope);
+        }
+        catch (error) {
+            throw deliveryFailure(error, 'file-upload');
+        }
+        scope.throwIfAborted();
+        const key = uploaded?.file_key ?? uploaded?.data?.file_key;
+        if (isRejectedCode(uploaded?.code) || !key)
+            throw new FileDeliveryError('rejected', `file-upload-rejected code=${String(uploaded?.code)}`);
+        const sent = await sendPayload(chatId, target, { msg_type: 'file', content: JSON.stringify({ file_key: key }) }, active).catch(error => { throw deliveryFailure(error, 'file-send') });
+        if (isRejectedCode(sent?.code))
+            throw new FileDeliveryError('rejected', `file-send-rejected code=${String(sent?.code)}`);
+        return { status: 'sent' };
+    }
+    async function sendImage(chatId, image, signal, target) {
+        if (!client || !lifecycle)
+            throw new Error(`${id}: 尚未连接`);
+        const data = Buffer.from(image.data ?? []);
+        if (!data.length)
+            throw new FileDeliveryError('rejected', 'image-empty');
+        if (data.length > MAX_IMAGE_UPLOAD_BYTES) {
+            log(`[${id}] 图片超过 10 MB，改按文件发送`);
+            return sendFile(chatId, image, signal, target);
+        }
+        const active = client;
+        const scope = AbortSignal.any([timeoutSignal(120_000, lifecycle.signal), ...(signal ? [signal] : [])]);
+        scope.throwIfAborted();
+        let uploaded;
+        try {
+            uploaded = await fileOperation(active.im.image.create({ data: { image_type: 'message', image: data } }), scope);
+        }
+        catch (error) {
+            const failure = deliveryFailure(error, 'image-upload');
+            if (failure.status === 'rejected') {
+                log(`[${id}] 图片上传被拒，改按文件发送`);
+                return sendFile(chatId, image, signal, target);
+            }
+            throw failure;
+        }
+        scope.throwIfAborted();
+        const key = uploaded?.image_key ?? uploaded?.data?.image_key;
+        if (isRejectedCode(uploaded?.code) || !key) {
+            log(`[${id}] 图片上传被拒，改按文件发送`);
+            return sendFile(chatId, image, signal, target);
+        }
+        const sent = await sendPayload(chatId, target, { msg_type: 'image', content: JSON.stringify({ image_key: key }) }, active).catch(error => { throw deliveryFailure(error, 'image-send') });
+        if (isRejectedCode(sent?.code))
+            throw new FileDeliveryError('rejected', `image-send-rejected code=${String(sent?.code)}`);
+        return { status: 'sent' };
+    }
+    async function sendText(chatId, text, target) {
+        if (!client)
+            throw new Error(`${id}: 尚未连接`);
+        const sender = client;
+        // 普通回复也走卡片 markdown，标题、列表和表格才会被渲染；按表格数量拆卡。
+        let delivered = false;
+        for (const part of splitByTableLimit(text)) {
+            try {
+                // 仅明确业务拒绝或 HTTP 400 回退；网络结果未知时不重发，避免重复投递。
+                // 飞书要渲染 Markdown 表格，卡片必须是 Schema 2.0（body.elements）
+                const card = await sendPayload(chatId, target, {
+                    msg_type: 'interactive',
+                    content: JSON.stringify({ schema: '2.0', config: { wide_screen_mode: true }, body: { elements: [{ tag: 'markdown', content: part }] } }),
+                }, sender).catch((error) => {
+                    const response = error?.response;
+                    // 旧接口也可能用 HTTP 400 返回限流，必须优先保留上层退避语义。
+                    if (response?.status !== 400 || throttledResponse(error))
+                        throw error;
+                    log(`[${id}] 卡片发送被拒，回退纯文本 ${httpFailureSummary(error)}`);
+                    return { code: 'http-400' };
+                });
+                if (!isRejectedCode(card?.code)) {
+                    delivered = true;
+                    continue;
+                }
+                // 被限流时改发纯文本只会再被限流，直接交给上层退避重试。
+                if (isThrottleCode(card?.code))
+                    throw new DeliveryRejected(`${id}: text-send-throttled code=${card?.code}`);
+                const rejected = card?.code;
+                // 卡片被拒（内容过大、接口不支持等）时退回纯文本，不丢正文。
+                const plain = await sendPayload(chatId, target, { msg_type: 'text', content: JSON.stringify({ text: part }) }, sender).catch((error) => {
+                    log(`[${id}] 纯文本回退发送失败 ${httpFailureSummary(error)}`);
+                    throw error;
+                });
+                if (isThrottleCode(plain?.code))
+                    throw new DeliveryRejected(`${id}: text-send-throttled code=${plain?.code}`);
+                if (isRejectedCode(plain?.code))
+                    throw new Error(`${id}: text-send-rejected code=${plain?.code} card=${String(rejected)}`);
+                delivered = true;
+            }
+            catch (error) {
+                const normalized = error instanceof DeliveryRejected || !throttledResponse(error)
+                    ? error : new DeliveryRejected(`${id}: text-send-throttled http=${error.response?.status}`);
+                throw delivered ? afterPartialDelivery(normalized) : normalized;
+            }
+        }
+    }
     return {
         id,
         label,
@@ -205,40 +362,63 @@ export function createFeishuChannel(id, config, log, loadSdk) {
                     const message = data.message;
                     if (!message)
                         return;
+                    const normalized = normalizeFeishuMessage(message, { source: 'event' });
                     const group = message.chat_type === 'group';
                     const addressed = !group || isFeishuBotMentioned(message.mentions, botOpenId);
-                    if (!addressed || !message.chat_id || !current())
+                    if (!addressed || !normalized.chatId || !current())
                         return;
-                    const chatId = message.chat_id;
+                    const chatId = normalized.chatId;
                     return incoming.run(chatId, async () => {
                         if (!current())
                             return;
-                        let resolved;
-                        try {
-                            resolved = await resolveFeishuContent(client, message, timeoutSignal(30_000, generation.signal));
-                        }
-                        catch {
-                            if (!current())
-                                return;
-                            log(`[${id}] 图片或消息读取失败`);
-                            await client?.im.message.create({
-                                params: { receive_id_type: 'chat_id' },
-                                data: { receive_id: message.chat_id, msg_type: 'text', content: JSON.stringify({ text: channelNotice(config.host, '图片或消息读取失败，请重发图片或发送文字。') }) },
-                            }).then(result => {
-                                const code = result?.code;
-                                if (isRejectedCode(code))
-                                    throw new Error('media-notice-rejected');
-                            }).catch(() => log(`[${id}] 媒体提示发送失败`));
+                        if (!normalized.supported) {
+                            await noticeTo(chatId, '暂不支持该消息类型，请发送文字、图片或文件。');
                             return;
+                        }
+                        if (!normalized.text && !normalized.attachments.length) {
+                            if (normalized.messageType !== 'text')
+                                await noticeTo(chatId, '图片或消息读取失败，请重发图片或发送文字。');
+                            return;
+                        }
+                        let quoted;
+                        let quotedError;
+                        const quoteId = normalized.parentId || normalized.rootId;
+                        if (quoteId && !normalized.text.trim().startsWith('/')) {
+                            try {
+                                const item = await readMessage(quoteId, timeoutSignal(CONTEXT_TIMEOUT_MS, generation.signal));
+                                if (item.deleted)
+                                    quotedError = 'withdrawn';
+                                else if (!item.supported && !item.text && !item.attachments.length)
+                                    quotedError = 'unsupported';
+                                else if (item.chatId && item.chatId !== normalized.chatId)
+                                    quotedError = 'not-found';
+                                else
+                                    quoted = { ...item, isRoot: !normalized.parentId && normalized.rootId === quoteId };
+                            }
+                            catch (error) {
+                                if (!current())
+                                    return;
+                                quotedError = readFailureReason(error);
+                                log(`[${id}] 引用消息读取失败 reason=${quotedError}`);
+                            }
                         }
                         if (!current())
                             return;
                         await handler?.({
                             chatId,
-                            userId: data.sender?.sender_id?.open_id,
-                            text: resolved.text,
-                            ...(resolved.media.length ? { media: resolved.media } : {}),
-                            messageId: message.message_id,
+                            userId: normalized.userId || data.sender?.sender_id?.open_id,
+                            text: normalized.text,
+                            messageId: normalized.messageId,
+                            parentId: normalized.parentId,
+                            rootId: normalized.rootId,
+                            threadId: normalized.threadId,
+                            createTime: normalized.createTime,
+                            mentions: normalized.mentions,
+                            links: normalized.links,
+                            attachments: normalized.attachments,
+                            attachmentsTruncated: normalized.attachmentsTruncated,
+                            ...(quoted ? { quoted } : {}),
+                            ...(quotedError ? { quotedError } : {}),
                             kind: group ? 'group' : 'dm',
                             addressed,
                         });
@@ -246,6 +426,17 @@ export function createFeishuChannel(id, config, log, loadSdk) {
                         log(`[${id}] 消息处理失败`); });
                 },
             });
+            async function noticeTo(chatId, key) {
+                const sent = await client?.im.message.create({
+                    params: { receive_id_type: 'chat_id' },
+                    data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text: channelNotice(config.host, key) }) },
+                }).catch(() => {
+                    log(`[${id}] 消息提示发送失败`);
+                    return undefined;
+                });
+                if (isRejectedCode(sent?.code))
+                    log(`[${id}] 消息提示发送失败 ${httpFailureSummary({ response: { data: { code: sent.code } } })}`);
+            }
             const wsClient = new sdk.WSClient({ appId, appSecret, logger, loggerLevel });
             ws = wsClient;
             await wsClient.start({ eventDispatcher: dispatcher });
@@ -260,60 +451,12 @@ export function createFeishuChannel(id, config, log, loadSdk) {
             statusText = '已停止';
         },
         canDeliverDeferred() { return statusText === '长连接已建立'; },
-        async send(chatId, text) {
-            if (!client)
-                throw new Error(`${id}: 尚未连接`);
-            const sender = client;
-            // 普通回复也走卡片 markdown，标题、列表和表格才会被渲染；按表格数量拆卡。
-            let delivered = false;
-            for (const part of splitByTableLimit(text)) {
-                try {
-                    // 仅明确业务拒绝或 HTTP 400 回退；网络结果未知时不重发，避免重复投递。
-                    // 飞书要渲染 Markdown 表格，卡片必须是 Schema 2.0（body.elements）
-                    const card = await sender.im.message.create({
-                        params: { receive_id_type: 'chat_id' },
-                        data: {
-                            receive_id: chatId,
-                            msg_type: 'interactive',
-                            content: JSON.stringify({ schema: '2.0', config: { wide_screen_mode: true }, body: { elements: [{ tag: 'markdown', content: part }] } }),
-                        },
-                    }).catch((error) => {
-                        const response = error?.response;
-                        // 旧接口也可能用 HTTP 400 返回限流，必须优先保留上层退避语义。
-                        if (response?.status !== 400 || throttledResponse(error))
-                            throw error;
-                        log(`[${id}] 卡片发送被拒，回退纯文本 ${httpFailureSummary(error)}`);
-                        return { code: 'http-400' };
-                    });
-                    if (!isRejectedCode(card?.code)) {
-                        delivered = true;
-                        continue;
-                    }
-                    // 被限流时改发纯文本只会再被限流，直接交给上层退避重试。
-                    if (isThrottleCode(card?.code))
-                        throw new DeliveryRejected(`${id}: text-send-throttled code=${card?.code}`);
-                    const rejected = card?.code;
-                    // 卡片被拒（内容过大、接口不支持等）时退回纯文本，不丢正文。
-                    const plain = await sender.im.message.create({
-                        params: { receive_id_type: 'chat_id' },
-                        data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text: part }) },
-                    }).catch((error) => {
-                        log(`[${id}] 纯文本回退发送失败 ${httpFailureSummary(error)}`);
-                        throw error;
-                    });
-                    if (isThrottleCode(plain?.code))
-                        throw new DeliveryRejected(`${id}: text-send-throttled code=${plain?.code}`);
-                    if (isRejectedCode(plain?.code))
-                        throw new Error(`${id}: text-send-rejected code=${plain?.code} card=${String(rejected)}`);
-                    delivered = true;
-                }
-                catch (error) {
-                    const normalized = error instanceof DeliveryRejected || !throttledResponse(error)
-                        ? error : new DeliveryRejected(`${id}: text-send-throttled http=${error.response?.status}`);
-                    throw delivered ? afterPartialDelivery(normalized) : normalized;
-                }
-            }
-        },
+        send: sendText,
+        sendFile,
+        sendImage,
+        readMessage,
+        listMessages,
+        downloadAttachment,
         async sendChoices(message, text, buttons) {
             if (!client)
                 throw new Error('channel-unavailable');
@@ -358,23 +501,6 @@ export function createFeishuChannel(id, config, log, loadSdk) {
             if (isRejectedCode(result.code))
                 throw new Error('reaction-rejected');
         },
-        async sendFile(chatId, file, signal) {
-            if (!client || !lifecycle)
-                throw new Error(`${id}: 尚未连接`);
-            const active = client;
-            const scope = AbortSignal.any([timeoutSignal(120_000, lifecycle.signal), ...(signal ? [signal] : [])]);
-            scope.throwIfAborted();
-            const uploaded = await fileOperation(active.im.file.create({ data: { file_type: 'stream', file_name: file.name, file: Buffer.from(file.data) } }), scope);
-            scope.throwIfAborted();
-            if (!uploaded?.file_key)
-                throw new Error('file-upload-rejected');
-            const sent = await active.im.message.create({
-                params: { receive_id_type: 'chat_id' },
-                data: { receive_id: chatId, msg_type: 'file', content: JSON.stringify({ file_key: uploaded.file_key }) },
-            });
-            if (isRejectedCode(sent.code))
-                throw new Error('file-send-rejected');
-        },
         setMessageHandler(h) { handler = h; },
         async diagnose(signal) {
             const domain = 'https://open.feishu.cn';
@@ -387,12 +513,34 @@ export function createFeishuChannel(id, config, log, loadSdk) {
             });
             if (auth.status !== 'passed')
                 return [auth];
-            return [auth, await probe('bot', signal, async () => {
-                    const data = await diagnosticJson(`${domain}/open-apis/bot/v3/info`, signal, undefined, { Authorization: `Bearer ${token}` });
+            const bot = await probe('bot', signal, async () => {
+                const data = await diagnosticJson(`${domain}/open-apis/bot/v3/info`, signal, undefined, { Authorization: `Bearer ${token}` });
+                platformResult(data.code);
+                const bot = data.bot;
+                requireDiagnostic(typeof bot?.open_id === 'string' && bot.open_id);
+            });
+            if (bot.status !== 'passed')
+                return [auth, bot];
+            // 读取应用自身信息核对历史消息与资源权限是否实际生效；不返回 scope 原文。
+            const scopes = await probe('scopes', signal, async () => {
+                let data;
+                try {
+                    data = await diagnosticJson(`${domain}/open-apis/application/v6/applications/${encodeURIComponent(appId)}?lang=zh_cn`, signal, undefined, { Authorization: `Bearer ${token}` });
                     platformResult(data.code);
-                    const bot = data.bot;
-                    requireDiagnostic(typeof bot?.open_id === 'string' && bot.open_id);
-                })];
+                }
+                catch (error) {
+                    // 没有应用配置读取权限时无法核对，但不把连接诊断判成失败。
+                    if (error?.reason === 'permission' || error?.platformCode === 99991672)
+                        throw new DiagnosticError('unsupported');
+                    throw error;
+                }
+                const present = new Set((data?.data?.app?.scopes ?? data?.app?.scopes ?? []).map(item => String(item?.scope ?? '')).filter(Boolean));
+                for (const scope of ['im:message:readonly', 'im:message.group_msg', 'im:resource']) {
+                    if (!present.has(scope))
+                        throw new DiagnosticError('permission');
+                }
+            });
+            return [auth, bot, scopes];
         },
         status() { return statusText; },
     };

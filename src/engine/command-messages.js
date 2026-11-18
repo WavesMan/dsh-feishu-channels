@@ -380,6 +380,7 @@ export const commandEnglish = {
     "图片下载失败或内容为空，请重新发送。": "The image download failed or was empty. Send it again.",
     "当前 Host 不支持 Chat 图片输入，请升级 DeepSeek Harness。": "This Host does not support Chat image input. Upgrade DeepSeek Harness.",
     "图片或消息读取失败，请重发图片或发送文字。": "The image or message could not be read. Send the image or text again.",
+    "暂不支持该消息类型，请发送文字、图片或文件。": "This message type is not supported. Send text, an image, or a file.",
     "图片下载失败：{0}。整条消息未提交，请重新发送。": "The image could not be downloaded: {0}. The message was not submitted. Send it again.",
     "图片或媒体下载失败，请重新发送。": "The image or media could not be downloaded. Send it again.",
     "图片读取失败：{0}。请重新发送；若仍失败请管理员检查网络和机器人配置。": "The image could not be read: {0}. Send it again. If it still fails, ask an administrator to check the network and bot configuration.",

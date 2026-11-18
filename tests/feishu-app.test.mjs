@@ -20,7 +20,7 @@ test('QR url prefills the channel name, scopes and create-only mode', () => {
   assert.equal(url.searchParams.get('source'), 'dsh-feishu-channels')
   assert.deepEqual(decodeAddons(url.searchParams.get('addons')), {
     scopes: {
-      tenant: ['im:message', 'application:application:patch'],
+      tenant: ['im:message', 'im:message:readonly', 'im:message.group_msg', 'im:resource', 'application:application:patch'],
       user: ['im:message.send_as_user'],
     },
   })
@@ -43,7 +43,7 @@ test('redirect URL list is exact and ordered', () => {
     'https://www.cubeai.com:6443/cubeaispace-dsh1-1234567890-dsh/api/dsh-feishu-client/oauth/callback',
   ])
   assert.deepEqual(FEISHU_APP_SCOPES, {
-    tenant: ['im:message', 'application:application:patch'],
+    tenant: ['im:message', 'im:message:readonly', 'im:message.group_msg', 'im:resource', 'application:application:patch'],
     user: ['im:message.send_as_user'],
   })
 })
@@ -57,6 +57,9 @@ function makeFakeClient() {
     app_name: '飞书频道1',
     scopes: [
       { scope: 'im:message' },
+      { scope: 'im:message:readonly' },
+      { scope: 'im:message.group_msg' },
+      { scope: 'im:resource' },
       { scope: 'im:message.send_as_user' },
     ],
     security: { redirect_urls: [...FEISHU_REDIRECT_URLS] },
@@ -108,6 +111,9 @@ test('provisioning applies name, scopes and redirect URLs through v7', async () 
   const config = calls.find(([name]) => name === 'v7.config.patch')[1]
   assert.deepEqual(config.data.scope.add_scopes, [
     { scope_name: 'im:message', token_type: 'tenant' },
+    { scope_name: 'im:message:readonly', token_type: 'tenant' },
+    { scope_name: 'im:message.group_msg', token_type: 'tenant' },
+    { scope_name: 'im:resource', token_type: 'tenant' },
     { scope_name: 'im:message.send_as_user', token_type: 'user' },
   ])
   assert.deepEqual(config.data.security.add.redirect_urls, FEISHU_REDIRECT_URLS)
@@ -140,6 +146,15 @@ test('provisioning falls back to v6 redirects and merges existing URLs', async (
   assert.ok(result.errors.some((item) => item.step === 'config-v7'))
 })
 
+
+test('provisioning reports missing history and resource scopes', async () => {
+  const { client, app } = makeFakeClient()
+  app.scopes = [{ scope: 'im:message' }, { scope: 'im:message.send_as_user' }]
+  const result = await provisionFeishuApp({ appId: 'cli_test', appSecret: 'secret', name: '飞书频道1', client })
+  assert.deepEqual(result.scopes.missing, ['im:message:readonly', 'im:message.group_msg', 'im:resource'])
+  assert.equal(result.scopes.applied, false)
+  assert.doesNotMatch(JSON.stringify(result), /secret/i)
+})
 
 test('beginFeishuQr reads the channel name from pairing settings', async () => {
   const originalFetch = globalThis.fetch

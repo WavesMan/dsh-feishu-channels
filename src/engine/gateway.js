@@ -1,15 +1,17 @@
+import { dirname, join } from 'node:path';
 import { DeferredDelivery, DeliveryRejected, DeliveryUnavailable } from './deferred-delivery.js';
-import { sleepWithSignal } from './abort.js';
+import { sleepWithSignal, timeoutSignal } from './abort.js';
 import { assistantText } from './assistant-text.js';
 import { readDeliveryHistory } from './delivery-history.js';
-import { FileInputError, filePromptParts } from './file-input.js';
+import { AttachmentSaveError, AttachmentStore, MAX_ATTACHMENT_BYTES } from './attachment-store.js';
+import { attachmentFailureLabel } from './file-input.js';
+import { composeSubmission, deliveryTargetOf } from './feishu-submission.js';
 import { ChoiceStore } from './choices.js';
 import { MessageProgress, ProgressTracker } from './message-progress.js';
 import { notice, replyText, withReplyLocale } from './command-locale.js';
 import { FileDelivery } from './file-delivery.js';
 import { ChatCommands } from './chat-commands.js';
 import { canExecuteCommand, normalizeCommandPermissions } from './command-permissions.js';
-import { ImageInputError, imageInputFailure, imagePromptPart } from './image-input.js';
 import { APPROVAL_WAIT_MS, ApprovalBroker } from './approval.js';
 import { SessionMerger } from './merge.js';
 import { KeyedSerialQueue } from './keyed-queue.js';
@@ -92,9 +94,15 @@ export class ImEngine {
     });
     mergedMessages = new Map();
     fileDelivery;
+    attachmentStore;
     chatCommands;
     commandScopes = new Map();
     inputScopes = new Map();
+    chatScopes = new Map();
+    activeScopes = new Map();
+    turnScopes = new Map();
+    pendingScopes = new Map();
+    registeredAgents = new WeakSet();
     /**
      * @param sendRetryDelaysMs 分片发送退避表；测试可传 `[0]` 关闭等待。
      */
@@ -118,8 +126,10 @@ export class ImEngine {
         // DSH 的真实 agents 类型比路由器所需的最小会话契约更严格，在此处完成边界适配。
         this.router = new SessionRouter(ctx, store, config, log, resolveConfig, {
             onDeliveryStopped: binding => this.streams.reset(`${binding.channelId}:${binding.chatId}`, binding.sessionId),
+            registerAgentTools: (agentCtx, agent, channelId) => this.registerAgentTools(agentCtx, agent, channelId),
         });
-        this.fileDelivery = new FileDelivery(ctx, log);
+        this.fileDelivery = new FileDelivery(ctx, log, deliveryFile ? join(dirname(deliveryFile), 'file-delivery.json') : undefined);
+        this.attachmentStore = new AttachmentStore(log);
         this.chatCommands = new ChatCommands(ctx, this.router, id => this.questions.has(id) || this.broker.has(id), (id, msg) => { if (msg.userId)
             this.sessionActors.set(id, msg.userId); }, (channel, msg, text, choices, session, allowNumber = true) => this.choices.show(channel, msg, text, choices, session, undefined, allowNumber ? undefined : replyText('点击按钮或发送对应命令；按钮 15 分钟内有效，普通文字继续聊天。'), allowNumber));
         this.merger = new SessionMerger((config.mergeTimeoutSecs || 5) * 1000, (key, text) => {
@@ -129,9 +139,12 @@ export class ImEngine {
             const channel = this.channels.get(channelId);
             if (!channel)
                 return;
-            const merged = { chatId: rest.split(':').slice(1).join(':') || rest, text, kind: rest.startsWith('group:') ? 'group' : 'dm' };
+            const sources = this.takeMergedMessages(key);
+            const last = sources[sources.length - 1];
+            const merged = { chatId: rest.split(':').slice(1).join(':') || rest, text, kind: rest.startsWith('group:') ? 'group' : 'dm',
+                ...(last ? { userId: last.userId, messageId: last.messageId, threadId: last.threadId, createTime: last.createTime } : {}) };
             // 合并窗口回调不在任何请求链路里，必须自兜底，否则 rejection 无人接
-            void this.inject(channel, merged, this.takeMergedMessages(key, merged)).catch((error) => {
+            void this.inject(channel, merged, sources.length ? sources : [merged]).catch((error) => {
                 const detail = error instanceof Error ? error.message : String(error);
                 this.log(`[${channelId}] 合并投递失败: ${detail}`);
                 channel.send(merged.chatId, notice(this.ctx, '消息处理失败，请查看本机日志。')).catch(() => undefined);
@@ -275,6 +288,10 @@ export class ImEngine {
         this.progress.cancel();
         this.mergedMessages.clear();
         this.interactionMessageIds.clear();
+        this.chatScopes.clear();
+        this.activeScopes.clear();
+        this.turnScopes.clear();
+        this.pendingScopes.clear();
         this.chatCommands.clear();
         for (const scope of this.commandScopes.values())
             scope.abort();
@@ -324,6 +341,14 @@ export class ImEngine {
         this.questionActors.delete(sessionId);
         this.questionDeliveries.delete(sessionId);
         this.questionPromptDelivered.delete(sessionId);
+        this.activeScopes.delete(sessionId);
+        this.chatScopes.delete(sessionId);
+        for (const key of [...this.turnScopes.keys()])
+            if (key.startsWith(`${sessionId}:`))
+                this.turnScopes.delete(key);
+        for (const [requestId, scope] of this.pendingScopes)
+            if (scope.sessionId === sessionId)
+                this.pendingScopes.delete(requestId);
     }
     isAuthorized(channelId, channel, msg) {
         if (msg.userId && this.resolvePrivateAccess(channelId) === 'all')
@@ -361,7 +386,7 @@ export class ImEngine {
             if (msg.userId)
                 this.chatActors.set(`${channelId}:${msg.kind === 'group' ? 'group' : 'dm'}:${msg.chatId}`, msg.userId);
             if (decision === 'deny') {
-                if (!msg.media?.length && await this.answerApproval(channelId, msg, this.approvalVerdict(msg.text)))
+                if (!msg.attachments?.length && await this.answerApproval(channelId, msg, this.approvalVerdict(msg.text)))
                     return;
                 await this.rejectUnauthorized(channelId, channel, msg);
                 return;
@@ -395,7 +420,7 @@ export class ImEngine {
                 text = selected;
                 msg = { ...msg, text, actionToken: undefined };
             }
-            if (text.startsWith('/') && !msg.media?.length) {
+            if (text.startsWith('/') && !msg.attachments?.length) {
                 if (!canExecuteCommand(this.resolveCommandPermissions(channelId), kind, msg.userId)) {
                     await this.deliver(channel, msg.chatId, withReplyLocale(this.ctx, () => replyText('当前聊天未开启命令权限，可以继续正常对话。')));
                     return;
@@ -427,7 +452,7 @@ export class ImEngine {
                     await this.deliver(channel, msg.chatId, notice(this.ctx, '只有发起当前任务的用户可以回答这个问题。'));
                     return;
                 }
-                if (!text || (msg.media?.length ?? 0) > 0) {
+                if (!text || (msg.attachments?.length ?? 0) > 0) {
                     await this.deliver(channel, msg.chatId, notice(this.ctx, '请用文字回答当前问题。'));
                     return;
                 }
@@ -456,14 +481,14 @@ export class ImEngine {
                     return;
                 }
             }
-            if (!msg.media?.length && await this.answerApproval(channelId, msg, this.approvalVerdict(text)))
+            if (!msg.attachments?.length && await this.answerApproval(channelId, msg, this.approvalVerdict(text)))
                 return;
-            if (binding && this.broker.has(binding.sessionId) && !msg.media?.length) {
+            if (binding && this.broker.has(binding.sessionId) && !msg.attachments?.length) {
                 await this.deliver(channel, msg.chatId, notice(this.ctx, '还有未完成的审批，请回复批准或拒绝，或点按钮。'));
                 return;
             }
-            if (msg.media && msg.media.length > 0) {
-                await this.inject(channel, msg);
+            if (msg.attachments?.length || (!text && (msg.quoted || msg.quotedError))) {
+                await this.inject(channel, msg, [msg]);
                 return;
             }
             if (!text)
@@ -476,12 +501,12 @@ export class ImEngine {
             this.mergedMessages.set(mergeKey, [...(this.mergedMessages.get(mergeKey) ?? []), msg]);
             const merged = this.merger.ingest(mergeKey, text);
             if (merged.kind === 'flushed' && merged.text) {
-                await this.inject(channel, { ...msg, text: merged.text }, this.takeMergedMessages(mergeKey, msg));
+                await this.inject(channel, { ...msg, text: merged.text }, this.takeMergedMessages(mergeKey));
             }
         }
         catch (error) {
             this.log(`[${channelId}] 处理失败: ${error instanceof Error ? error.message : String(error)}`);
-            await channel.send(msg.chatId, error instanceof FileInputError ? error.message : msg.media?.some(media => media.kind === 'file') ? withReplyLocale(this.ctx, () => replyText('文件输入失败，整条消息未提交。请检查文件大小和格式后重新发送，或在网页 Chat 上传。')) : msg.media?.some(media => media.kind === 'image') ? withReplyLocale(this.ctx, () => imageInputFailure(error)) : notice(this.ctx, '消息处理失败，请查看本机日志。')).catch(() => undefined);
+            await channel.send(msg.chatId, notice(this.ctx, '消息处理失败，请查看本机日志。')).catch(() => undefined);
         }
     }
     validDelivery(entry) {
@@ -578,21 +603,22 @@ export class ImEngine {
                 this.commandScopes.delete(key);
         }
     }
-    takeMergedMessages(key, fallback) {
-        const messages = this.mergedMessages.get(key) ?? [fallback];
+    takeMergedMessages(key) {
+        const messages = this.mergedMessages.get(key) ?? [];
         this.mergedMessages.delete(key);
         return messages;
     }
     async inject(channel, msg, sources = [msg]) {
         if (this.disposed || this.channels.get(channel.id) !== channel)
             return;
+        const list = sources.length ? sources : [msg];
         let scope = this.inputScopes.get(channel.id);
         if (!scope)
             this.inputScopes.set(channel.id, scope = new AbortController());
         const { signal } = scope;
         // 账号级发送方式：steer 作为补充指令进入下一步边界，不再显示「排队中」。
         const sendMode = this.resolveConfig(channel.id).sendMode === 'steer' ? 'steer' : 'queue';
-        const items = sources.map(source => new MessageProgress(channel, source, this.ctx, this.log, sendMode === 'steer' ? 'processing' : 'queued'));
+        const items = list.map(source => new MessageProgress(channel, source, this.ctx, this.log, sendMode === 'steer' ? 'processing' : 'queued'));
         let accepted = false;
         let submitted = false;
         let requestId;
@@ -600,27 +626,20 @@ export class ImEngine {
             item.finish('error'); };
         try {
             const kind = msg.kind === 'group' ? 'group' : 'dm';
-            const initialTitle = initialSessionTitle(msg.text) || initialSessionTitle(msg.media?.find(item => item.name)?.name || '');
+            const firstAttachment = list.find(source => source.attachments?.length)?.attachments[0]?.name;
+            const initialTitle = initialSessionTitle(msg.text) || initialSessionTitle(firstAttachment || '');
             const title = initialTitle || msg.username || msg.chatId;
             const binding = await this.router.getOrCreate(channel.id, kind, msg.chatId, title);
             if (initialTitle)
                 this.router.setTitle(binding.sessionId, initialTitle, 'message');
-            const content = [];
-            if (msg.text.trim())
-                content.push({ type: 'text', text: msg.text.trim() });
-            for (const media of msg.media ?? []) {
-                if (media.kind === 'image')
-                    content.push(await imagePromptPart(media));
-                else if (media.kind === 'voice-text' && media.text)
-                    content.push({ type: 'text', text: `[语音] ${media.text}` });
-                else if (media.kind !== 'file' && media.path)
-                    content.push({ type: 'text', text: `[附件 ${media.name ?? media.kind}] ${media.path}` });
-            }
-            const files = msg.media?.filter(media => media.kind === 'file') ?? [];
-            if (files.length)
-                content.push(...await withReplyLocale(this.ctx, () => filePromptParts(this.ctx, binding.sessionId, files, signal)));
-            if (signal.aborted || content.length === 0)
+            const saved = await this.saveAttachments(channel, binding, list, signal);
+            const composed = composeSubmission(list, saved);
+            if (signal.aborted)
                 return;
+            if (!composed.trim()) {
+                // 没有正文也没有可用材料时不提交空消息；附件失败原因已经写进 composed。
+                return;
+            }
             if (msg.userId)
                 this.sessionActors.set(binding.sessionId, msg.userId);
             this.interactionMessageIds.set(binding.sessionId, msg.messageId);
@@ -628,32 +647,25 @@ export class ImEngine {
             if (signal.aborted)
                 return;
             requestId = crypto.randomUUID();
-            this.deferred.begin(requestId, binding.sessionId, channel.id, { ...msg, userId: msg.userId ?? sources[0]?.userId });
+            const userId = msg.userId ?? list[list.length - 1]?.userId;
+            const requestScope = this.createRequestScope(channel, binding, list, saved, userId);
+            this.pendingScopes.set(requestId, requestScope);
+            this.chatScopes.set(binding.sessionId, requestScope);
+            this.deferred.begin(requestId, binding.sessionId, channel.id, { ...msg, userId, sources: requestScope.sources });
             reject = this.progress.begin(binding.sessionId, requestId, items);
-            if (content.some(part => part.type === 'image' || part.type === 'file')) {
-                // Use Chat's public admission entry: session-local model selection, shared
-                // model-switch serialization, and durable attachment validation/storage.
-                // Optional lookup preserves text-only operation on older Hosts. Keep
-                // strict lookup so a pending or unloading provider is never invoked.
-                const controller = this.ctx.get('sessionController');
-                if (!controller?.prompt)
-                    throw new ImageInputError('当前 Host 不支持 Chat 图片输入，请升级 DeepSeek Harness。');
-                submitted = true;
-                await controller.prompt({ requestId, sessionId: binding.sessionId, mode: sendMode, content }, signal);
-            }
-            else {
-                submitted = true;
-                this.router.followup(binding, {
-                    id: requestId,
-                    role: 'user',
-                    content,
-                    source: { kind: 'user', rpcId: requestId },
-                }, sendMode);
-            }
+            submitted = true;
+            this.router.followup(binding, {
+                id: requestId,
+                role: 'user',
+                content: [{ type: 'text', text: composed.trim() }],
+                source: { kind: 'user', rpcId: requestId },
+            }, sendMode);
             accepted = true;
             this.log(`[${channel.id}] 已注入 ${binding.sessionId}`);
         }
         catch (error) {
+            if (requestId)
+                this.pendingScopes.delete(requestId);
             try {
                 if (requestId)
                     this.deferred.reject(requestId, !submitted);
@@ -674,6 +686,401 @@ export class ImEngine {
                 for (const item of items)
                     item.finish('cancelled');
         }
+    }
+    /** 当前消息与直接引用里的附件先落到会话工作区；失败项只返回原因。 */
+    async saveAttachments(channel, binding, sources, signal) {
+        const attachments = [];
+        const seen = new Set();
+        for (const source of sources) {
+            for (const attachment of [...(source.attachments ?? []), ...(source.quoted?.attachments ?? [])]) {
+                if (!attachment?.id || seen.has(attachment.id))
+                    continue;
+                seen.add(attachment.id);
+                attachments.push(attachment);
+            }
+        }
+        if (!attachments.length)
+            return [];
+        let cwd;
+        try {
+            cwd = await this.router.workspaceFor(binding);
+        }
+        catch (error) {
+            this.log(`[${channel.id}] 无法确定附件工作区: ${error instanceof Error ? error.message : String(error)}`);
+            return attachments.map(attachment => ({
+                attachmentId: attachment.id, name: attachment.name, sourceMessageId: attachment.sourceMessageId,
+                status: 'failed', reason: 'workspace-unavailable',
+            }));
+        }
+        const results = [];
+        let budget = MAX_ATTACHMENT_BYTES;
+        for (const attachment of attachments) {
+            if (!channel.downloadAttachment) {
+                results.push({ attachmentId: attachment.id, name: attachment.name, sourceMessageId: attachment.sourceMessageId, status: 'failed', reason: 'download-failed' });
+                continue;
+            }
+            if (budget <= 0) {
+                results.push({ attachmentId: attachment.id, name: attachment.name, sourceMessageId: attachment.sourceMessageId, status: 'failed', reason: 'too-large' });
+                continue;
+            }
+            try {
+                const record = await this.attachmentStore.save({
+                    cwd, channelId: channel.id, chatId: binding.chatId,
+                    sourceMessageId: attachment.sourceMessageId, attachment, signal, maxBytes: budget,
+                    download: downloadSignal => channel.downloadAttachment(attachment, downloadSignal, budget),
+                });
+                budget -= record.bytes;
+                results.push({
+                    attachmentId: attachment.id, name: record.name, path: record.path, bytes: record.bytes,
+                    status: 'done', sourceMessageId: attachment.sourceMessageId, kind: attachment.kind,
+                });
+            }
+            catch (error) {
+                const reason = error instanceof AttachmentSaveError ? error.reason : signal.aborted ? 'cancelled' : 'download-failed';
+                this.log(`[${channel.id}] 附件保存失败 reason=${reason}`);
+                results.push({ attachmentId: attachment.id, name: attachment.name, sourceMessageId: attachment.sourceMessageId, status: 'failed', reason });
+            }
+        }
+        return results;
+    }
+    /** 请求作用域绑定当前频道、聊天、触发消息与可访问附件；工具读取不得越出这里。 */
+    createRequestScope(channel, binding, sources, saved, userId) {
+        const last = sources[sources.length - 1] ?? {};
+        const target = deliveryTargetOf(sources);
+        const scope = {
+            sessionId: binding.sessionId,
+            channelId: channel.id,
+            chatId: binding.chatId,
+            kind: binding.kind ?? (last.kind === 'group' ? 'group' : 'dm'),
+            userId,
+            messageId: target?.messageId,
+            threadId: target?.threadId ?? last.threadId ?? '',
+            triggerTime: Number(last.createTime) || Date.now(),
+            sources: sources.map(item => ({
+                messageId: item.messageId ?? '', userId: item.userId ?? '',
+                createTime: Number(item.createTime) || 0, threadId: item.threadId ?? '',
+            })),
+            known: new Map(),
+            attachments: new Map(),
+            threads: new Set(),
+            downloadedBytes: 0,
+        };
+        for (const source of sources) {
+            this.registerContext(scope, source);
+            if (source.quoted)
+                this.registerContext(scope, source.quoted);
+        }
+        for (const item of saved) {
+            if (item.status === 'done') {
+                scope.downloadedBytes += item.bytes;
+                const attachment = scope.attachments.get(item.attachmentId);
+                if (attachment)
+                    scope.attachments.set(item.attachmentId, { ...attachment, saved: item });
+            }
+        }
+        return scope;
+    }
+    registerContext(scope, message) {
+        if (!message)
+            return;
+        if (message.messageId)
+            scope.known.set(message.messageId, message);
+        if (message.threadId)
+            scope.threads.add(message.threadId);
+        for (const attachment of message.attachments ?? [])
+            if (attachment?.id)
+                scope.attachments.set(attachment.id, attachment);
+    }
+    activeScope(sessionId) {
+        return this.activeScopes.get(sessionId);
+    }
+    replyTarget(sessionId) {
+        const scope = this.activeScopes.get(sessionId) ?? this.chatScopes.get(sessionId);
+        return scope?.messageId ? { messageId: scope.messageId } : undefined;
+    }
+    /** 只在当前 Agent 作用域注册；恢复或换绑同一 Agent 时不重复注册。 */
+    registerAgentTools(agentCtx, agent, channelId) {
+        if (!agent || this.registeredAgents.has(agent))
+            return;
+        const tools = agentCtx?.tools;
+        if (!tools || typeof tools.register !== 'function')
+            return;
+        const sessionId = String(agent.session?.id ?? agent.id ?? '');
+        if (!sessionId)
+            return;
+        this.registeredAgents.add(agent);
+        const register = (definition) => {
+            try {
+                tools.register(definition);
+            }
+            catch (error) {
+                this.log(`[${channelId}] 注册工具失败 ${definition.name}: ${error instanceof Error ? error.message : String(error)}`);
+            }
+        };
+        register(this.readContextTool(channelId, sessionId));
+        register(this.downloadAttachmentTool(channelId, sessionId));
+        let hasPresent = false;
+        try {
+            hasPresent = !!tools.get('present');
+        }
+        catch {
+            hasPresent = false;
+        }
+        // 宿主已有 present 时直接复用它的交付入口与 deliverables/presented 事件。
+        if (!hasPresent)
+            register(this.deliverFileTool(channelId, sessionId));
+    }
+    readContextTool(channelId, sessionId) {
+        const self = this;
+        const messageSchema = {
+            type: 'object', additionalProperties: false,
+            properties: {
+                message_id: { type: 'string' },
+                message_type: { type: 'string' },
+                sender: { type: 'string' },
+                create_time: { type: 'string' },
+                text: { type: 'string' },
+                links: { type: 'array', items: { type: 'string' } },
+                mentions: { type: 'array', items: { type: 'string' } },
+                attachments: { type: 'array', items: { type: 'object', additionalProperties: false, properties: {
+                            attachment_id: { type: 'string' }, kind: { type: 'string' }, name: { type: 'string' },
+                        }, required: ['attachment_id', 'kind'] } },
+                quoted_message_id: { type: 'string' },
+            },
+            required: ['message_id', 'message_type', 'sender', 'text', 'links', 'mentions', 'attachments'],
+        };
+        return {
+            name: 'feishu_read_context',
+            description: '读取当前飞书请求范围内的消息上下文：指定消息、当前话题回复，或触发消息之前的近期消息。只能读取当前聊天；历史附件只返回清单，不自动下载。读取结果不会重新触发任务。',
+            parameters: {
+                type: 'object', additionalProperties: false,
+                properties: {
+                    mode: { type: 'string', enum: ['message', 'thread', 'recent'], description: '读取方式：message=指定消息，thread=当前话题，recent=触发消息之前的近期消息。' },
+                    message_id: { type: 'string', description: 'mode=message 时要读取的消息 ID。' },
+                    thread_id: { type: 'string', description: 'mode=thread 时的话题 ID；省略则使用当前触发消息所属话题。' },
+                    limit: { type: 'integer', description: '最多返回 1-30 条；默认 20。' },
+                    page_token: { type: 'string', description: '上一页返回的分页令牌。' },
+                },
+                required: ['mode'],
+            },
+            output: {
+                schema: {
+                    type: 'object', additionalProperties: false,
+                    properties: {
+                        ok: { type: 'boolean' },
+                        mode: { type: 'string' },
+                        messages: { type: 'array', items: messageSchema },
+                        truncated: { type: 'boolean' },
+                        has_more: { type: 'boolean' },
+                        page_token: { type: 'string' },
+                        error: { type: 'string' },
+                    },
+                    required: ['ok'],
+                },
+                render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+            },
+            async execute(args, exec) {
+                try {
+                    return await self.readContextForTool(channelId, sessionId, args ?? {}, exec.signal);
+                }
+                catch (error) {
+                    const aborted = error?.name === 'AbortError' || error?.name === 'TimeoutError';
+                    return { ok: false, error: aborted ? '读取超时或已取消' : '消息读取失败，可能缺少权限或消息已不可用' };
+                }
+            },
+        };
+    }
+    downloadAttachmentTool(channelId, sessionId) {
+        const self = this;
+        return {
+            name: 'feishu_download_attachment',
+            description: '把当前请求可访问的飞书消息附件下载到当前会话工作区，返回实际保存路径；下载失败时只返回原因，不返回路径。附件 ID 来自触发消息、引用消息或 feishu_read_context 的附件清单。',
+            parameters: {
+                type: 'object', additionalProperties: false,
+                properties: { attachment_id: { type: 'string', description: '附件清单中的附件 ID。' } },
+                required: ['attachment_id'],
+            },
+            output: {
+                schema: {
+                    type: 'object', additionalProperties: false,
+                    properties: {
+                        status: { type: 'string' },
+                        path: { type: 'string' },
+                        source_message_id: { type: 'string' },
+                        size: { type: 'integer' },
+                        name: { type: 'string' },
+                        error: { type: 'string' },
+                    },
+                    required: ['status'],
+                },
+                render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+            },
+            async execute(args, exec) {
+                const input = args ?? {};
+                const scope = self.activeScope(sessionId);
+                if (!scope || scope.channelId !== channelId)
+                    return { status: 'failed', error: '当前没有可用的飞书消息上下文' };
+                const attachment = scope.attachments.get(String(input.attachment_id ?? ''));
+                if (!attachment)
+                    return { status: 'failed', error: '附件不在当前请求可访问的消息清单中' };
+                const channel = self.channels.get(channelId);
+                if (!channel?.downloadAttachment)
+                    return { status: 'failed', error: '当前频道不支持附件下载' };
+                try {
+                    const record = await self.downloadForScope(scope, channel, attachment, exec.signal);
+                    if (record.status === 'done')
+                        return { status: 'downloaded', path: record.path, source_message_id: record.messageId, size: record.bytes, name: record.name };
+                    return { status: 'failed', error: attachmentFailureLabel(record.error ?? record.reason ?? 'download-failed') };
+                }
+                catch (error) {
+                    const reason = error?.reason ?? (exec.signal.aborted ? 'cancelled' : 'download-failed');
+                    return { status: 'failed', error: attachmentFailureLabel(reason) };
+                }
+            },
+        };
+    }
+    deliverFileTool(channelId, sessionId) {
+        const self = this;
+        return {
+            name: 'feishu_deliver_file',
+            description: '把当前工作区中的已有文件发送到当前飞书聊天：图片按图片消息发送，普通文件按文件消息发送。仅在用户明确需要收到该文件时调用；同一回合同一文件不会重复发送。',
+            parameters: {
+                type: 'object', additionalProperties: false,
+                properties: { path: { type: 'string', description: '工作区中的文件路径。' } },
+                required: ['path'],
+            },
+            output: {
+                schema: {
+                    type: 'object', additionalProperties: false,
+                    properties: { delivered: { type: 'boolean' }, path: { type: 'string' }, error: { type: 'string' } },
+                    required: ['delivered'],
+                },
+                render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+            },
+            async execute(args, exec) {
+                const input = args ?? {};
+                const scope = self.activeScope(sessionId);
+                if (!scope || scope.channelId !== channelId)
+                    return { delivered: false, error: '当前没有可用的飞书聊天' };
+                const channel = self.channels.get(channelId);
+                if (!channel)
+                    return { delivered: false, error: '当前频道不可用' };
+                const path = typeof input.path === 'string' ? input.path.trim() : '';
+                if (!path)
+                    return { delivered: false, error: '文件路径为空' };
+                let turn;
+                try {
+                    turn = self.ctx.agents?.turnBoundaryOf?.(exec.agent?.session)?.lastTurn;
+                }
+                catch {
+                    turn = undefined;
+                }
+                const result = await self.fileDelivery.deliverPath({
+                    sessionId, session: exec.agent?.session, channel, chatId: scope.chatId,
+                    messageId: scope.messageId, path, turn, signal: exec.signal,
+                });
+                if (result.status === 'sent' || result.status === 'skipped')
+                    return { delivered: true, path };
+                return { delivered: false, error: result.status === 'missing' ? '文件不存在或不完整' : '发送失败或结果未知' };
+            },
+        };
+    }
+    async readContextForTool(channelId, sessionId, args, signal) {
+        const scope = this.activeScope(sessionId);
+        if (!scope || scope.channelId !== channelId)
+            return { ok: false, error: '当前没有可用的飞书消息上下文' };
+        const channel = this.channels.get(channelId);
+        if (!channel?.readMessage && !channel?.listMessages)
+            return { ok: false, error: '当前频道不支持消息上下文读取' };
+        const scopeSignal = timeoutSignal(60_000, signal);
+        const limit = Math.min(30, Math.max(1, Number.isSafeInteger(args.limit) ? args.limit : 20));
+        const pageToken = typeof args.page_token === 'string' ? args.page_token : '';
+        if (args.mode === 'message') {
+            const messageId = typeof args.message_id === 'string' ? args.message_id : '';
+            if (!messageId)
+                return { ok: false, error: '需要 message_id' };
+            const message = scope.known.get(messageId) ?? await channel.readMessage(messageId, scopeSignal);
+            if (!message?.chatId || message.chatId !== scope.chatId)
+                return { ok: false, error: '该消息不属于当前聊天，未读取' };
+            if (message.deleted)
+                return { ok: false, error: '消息已撤回或删除' };
+            this.registerContext(scope, message);
+            return { ok: true, mode: 'message', messages: [this.contextView(message)], truncated: false, has_more: false };
+        }
+        if (args.mode === 'thread') {
+            const threadId = String(args.thread_id ?? scope.threadId ?? '');
+            if (!threadId)
+                return { ok: false, error: '当前消息不在话题中，也没有指定 thread_id' };
+            if (!scope.threads.has(threadId))
+                return { ok: false, error: '只能读取当前请求关联的话题' };
+            const page = await channel.listMessages({ chatId: scope.chatId, threadId, pageSize: limit, pageToken }, scopeSignal);
+            return this.contextPage(scope, page, 'thread', limit);
+        }
+        if (args.mode === 'recent') {
+            const page = await channel.listMessages({ chatId: scope.chatId, endTime: scope.triggerTime || Date.now(), pageSize: limit, pageToken }, scopeSignal);
+            return this.contextPage(scope, page, 'recent', limit);
+        }
+        return { ok: false, error: '不支持的读取方式' };
+    }
+    contextPage(scope, page, mode, limit) {
+        const messages = [];
+        let chars = 0;
+        let truncated = page.hasMore;
+        for (const message of page.messages) {
+            if (message.messageId && message.messageId === scope.messageId)
+                continue;
+            const view = this.contextView(message);
+            const size = view.text.length + 200;
+            if (messages.length >= limit || chars + size > 20_000) {
+                truncated = true;
+                break;
+            }
+            this.registerContext(scope, message);
+            chars += size;
+            messages.push(view);
+        }
+        return {
+            ok: true, mode, messages, truncated,
+            has_more: page.hasMore,
+            ...(page.pageToken ? { page_token: page.pageToken } : {}),
+        };
+    }
+    contextView(message) {
+        const text = typeof message.text === 'string' ? message.text : '';
+        return {
+            message_id: message.messageId ?? '',
+            message_type: message.messageType || '',
+            sender: message.userId || '未知',
+            create_time: message.createTime ? new Date(message.createTime).toISOString() : '',
+            text: text.length > 4_000 ? `${text.slice(0, 4_000)}…（已截断）` : text,
+            links: (message.links ?? []).slice(0, 20),
+            mentions: (message.mentions ?? []).map(mention => mention.name || mention.id).filter(Boolean).slice(0, 20),
+            attachments: (message.attachments ?? []).map(attachment => ({
+                attachment_id: attachment.id, kind: attachment.kind, name: attachment.name || '',
+            })),
+            ...(message.parentId ? { quoted_message_id: message.parentId } : {}),
+        };
+    }
+    async downloadForScope(scope, channel, attachment, signal) {
+        const cwd = await this.router.workspaceForSession(scope.sessionId);
+        const cached = scope.attachments.get(attachment.id)?.saved;
+        if (cached?.status === 'done') {
+            const verified = await this.attachmentStore.verified(cwd, attachment.id);
+            if (verified)
+                return verified;
+            scope.downloadedBytes = Math.max(0, (scope.downloadedBytes ?? 0) - (cached.bytes ?? 0));
+        }
+        const remaining = MAX_ATTACHMENT_BYTES - (scope.downloadedBytes ?? 0);
+        if (remaining <= 0)
+            throw Object.assign(new Error('too-large'), { reason: 'too-large' });
+        const record = await this.attachmentStore.save({
+            cwd, channelId: scope.channelId, chatId: scope.chatId,
+            sourceMessageId: attachment.sourceMessageId, attachment, signal, maxBytes: remaining,
+            download: downloadSignal => channel.downloadAttachment(attachment, downloadSignal, remaining),
+        });
+        scope.downloadedBytes = (scope.downloadedBytes ?? 0) + record.bytes;
+        scope.attachments.set(attachment.id, { ...attachment, saved: { ...record, status: 'done' } });
+        return record;
     }
     cancelInputs(channelId) {
         if (!this.disposed)
@@ -700,7 +1107,7 @@ export class ImEngine {
         return undefined;
     }
     async answerApproval(channelId, msg, allow) {
-        if (allow === undefined || msg.media?.length)
+        if (allow === undefined || msg.attachments?.length)
             return false;
         const binding = this.router.lookup(channelId, msg.kind === 'group' ? 'group' : 'dm', msg.chatId);
         if (!binding)
@@ -1015,9 +1422,30 @@ export class ImEngine {
             if (this.observedTurns.size >= 1024)
                 this.observedTurns.delete(this.observedTurns.keys().next().value);
             this.observedTurns.set(id, event.data.turn);
+            const scope = this.turnScopes.get(`${id}:${event.data.turn}`);
+            if (scope)
+                this.activeScopes.set(id, scope);
         }
-        if (event.type === 'user/message' && this.observedTurns.has(id))
-            this.deferred.claim(id, this.observedTurns.get(id), event.data?.source?.rpcId ?? event.data?.id ?? '');
+        if (event.type === 'user/message') {
+            const rpcId = event.data?.source?.rpcId ?? event.data?.id ?? '';
+            if (this.observedTurns.has(id))
+                this.deferred.claim(id, this.observedTurns.get(id), rpcId);
+            const scope = this.pendingScopes.get(rpcId);
+            if (scope) {
+                this.pendingScopes.delete(rpcId);
+                const turn = event.data?.turn ?? this.observedTurns.get(id);
+                if (Number.isSafeInteger(turn))
+                    this.turnScopes.set(`${id}:${turn}`, scope);
+                if (!this.activeScopes.has(id))
+                    this.activeScopes.set(id, scope);
+            }
+        }
+        if (event.type === 'turn/end') {
+            this.activeScopes.delete(id);
+            for (const key of [...this.turnScopes.keys()])
+                if (key.startsWith(`${id}:`))
+                    this.turnScopes.delete(key);
+        }
         const turn = event.data?.turn ?? this.observedTurns.get(id);
         if (['assistant/chunk', 'assistant/message', 'turn/end'].includes(event.type ?? '') && this.deferred.coldTurn(id, turn))
             return Promise.resolve();
@@ -1059,6 +1487,8 @@ export class ImEngine {
         if (!binding || !channel)
             return;
         const streamKey = `${binding.channelId}:${binding.chatId}`;
+        // 有明确触发消息时用回复接口关联来源；话题由回复 API 保持。
+        const target = this.replyTarget(sessionId);
         const stillDeliverable = () => {
             const current = this.router.bindingForSession(sessionId);
             return !this.disposed && current?.channelId === binding.channelId && current.chatId === binding.chatId
@@ -1087,10 +1517,10 @@ export class ImEngine {
                     return;
                 let failureDelivered;
                 if (taken.stream) {
-                    failureDelivered = await taken.stream.finish([taken.text, failed].filter(Boolean).join('\n\n')).then(() => true).catch(() => this.deliver(channel, binding.chatId, failed));
+                    failureDelivered = await taken.stream.finish([taken.text, failed].filter(Boolean).join('\n\n')).then(() => true).catch(() => this.deliver(channel, binding.chatId, failed, undefined, target));
                 }
                 else {
-                    failureDelivered = await this.deliver(channel, binding.chatId, failed);
+                    failureDelivered = await this.deliver(channel, binding.chatId, failed, undefined, target);
                 }
                 // 仅在确已送达时标记，失败后同回合残留的 assistant/message 还有机会补发
                 if (failureDelivered)
@@ -1140,7 +1570,7 @@ export class ImEngine {
                     outcome.content = true;
                     markAttempt();
                     this.log(`[${channel.id}] 准备回复 ${sessionId}，长度 ${text.length}`);
-                    const delivered = await this.deliver(channel, binding.chatId, text, outcome);
+                    const delivered = await this.deliver(channel, binding.chatId, text, outcome, target);
                     outcome.ok = outcome.ok && delivered;
                 }
                 else {
@@ -1149,7 +1579,10 @@ export class ImEngine {
             }
             finally {
                 const filesOk = await this.fileDelivery.deliver(session, event, () => {
-                    return !stopped && stillDeliverable() ? { channel, chatId: binding.chatId } : undefined;
+                    if (stopped || !stillDeliverable())
+                        return undefined;
+                    const currentTarget = this.replyTarget(sessionId);
+                    return { channel, chatId: binding.chatId, messageId: currentTarget?.messageId };
                 }, () => { outcome.content = true; markAttempt(); });
                 outcome.ok = outcome.ok && filesOk;
             }
@@ -1209,13 +1642,13 @@ export class ImEngine {
                 this.deferred.patch(id, { status: 'sent' });
     }
     /** 逐片发送；返回是否至少送达过一片，供调用方决定是否标记已投递。 */
-    async deliver(channel, chatId, text, outcome) {
+    async deliver(channel, chatId, text, outcome, target) {
         let deliveredAny = false;
         let ambiguous = false;
         // 重试预算按整条回复共享：钱花在第一个被拒的分片上，窗口一开后面的分片自然跟上。
         const deadline = Date.now() + SEND_RETRY_BUDGET_MS;
         for (const chunk of splitText(text, channel.maxMessageLength)) {
-            const result = await this.sendChunk(channel, chatId, chunk, deadline);
+            const result = await this.sendChunk(channel, chatId, chunk, deadline, target);
             if (result.ok) {
                 deliveredAny = true;
                 this.log(`[${channel.id}] 已投递 ${chatId}，长度 ${chunk.length}`);
@@ -1238,7 +1671,7 @@ export class ImEngine {
      * 结果不明的失败（超时、网络中断）立即返回：请求可能已经送达。
      * 等待超过 `deadline` 就放弃，让整条回复的重试开销有上界。
      */
-    async sendChunk(channel, chatId, chunk, deadline) {
+    async sendChunk(channel, chatId, chunk, deadline, target) {
         let error;
         for (const [attempt, delay] of this.sendRetryDelaysMs.entries()) {
             if (attempt > 0) {
@@ -1256,7 +1689,7 @@ export class ImEngine {
                     break;
             }
             try {
-                await channel.send(chatId, chunk);
+                await channel.send(chatId, chunk, target);
                 return { ok: true };
             }
             catch (caught) {

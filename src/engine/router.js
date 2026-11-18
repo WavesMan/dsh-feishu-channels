@@ -26,6 +26,7 @@ export class SessionRouter {
     channelOperations = new KeyedSerialQueue();
     disposeTimeoutMs;
     onDeliveryStopped;
+    registerAgentTools;
     constructor(ctx, store, config, log, resolveConfig = () => config, options = {}) {
         this.ctx = ctx;
         this.store = store;
@@ -34,6 +35,7 @@ export class SessionRouter {
         this.resolveConfig = resolveConfig;
         this.disposeTimeoutMs = Math.max(1, options.disposeTimeoutMs ?? DEFAULT_DISPOSE_TIMEOUT_MS);
         this.onDeliveryStopped = options.onDeliveryStopped;
+        this.registerAgentTools = options.registerAgentTools;
     }
     get(channelId, kind, chatId) {
         return this.live.get(sessionKeyOf(channelId, kind, chatId));
@@ -193,6 +195,42 @@ export class SessionRouter {
             throw new Error(replyText('无法确定当前会话工作区，请使用 /workspace 重新选择。'));
         return undefined;
     }
+    /** 当前绑定的实际工作区；附件必须先落到这里，不能用插件进程目录代替。 */
+    async workspaceFor(binding) {
+        const live = binding?.handle?.agent?.session?.header?.cwd;
+        if (typeof live === 'string' && live)
+            return live;
+        const record = this.store.findSession(binding?.sessionId ?? '');
+        if (record) {
+            const workspace = await this.sessionWorkspace(record);
+            if (workspace)
+                return workspace;
+        }
+        const fallback = await this.sessionWorkspace({ sessionId: binding?.sessionId ?? '' });
+        if (fallback)
+            return fallback;
+        throw new Error(replyText('无法确定当前会话工作区，请使用 /workspace 重新选择。'));
+    }
+    async workspaceForSession(sessionId) {
+        const binding = this.bindingForSession(sessionId);
+        if (binding)
+            return this.workspaceFor(binding);
+        const record = this.store.findSession(sessionId);
+        const workspace = record ? await this.sessionWorkspace(record) : undefined;
+        if (workspace)
+            return workspace;
+        throw new Error(replyText('无法确定当前会话工作区，请使用 /workspace 重新选择。'));
+    }
+    registerToolsFor(agentCtx, agent, channelId) {
+        if (!this.registerAgentTools || !agent)
+            return;
+        try {
+            this.registerAgentTools(agentCtx ?? agent.ctx, agent, channelId);
+        }
+        catch (error) {
+            this.log(`[router] 注册 Feishu 工具失败 ${channelId}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
     rename(sessionId, title) {
         return this.setTitle(sessionId, title, 'user');
     }
@@ -220,6 +258,7 @@ export class SessionRouter {
             this.historical.delete(sessionId);
             this.live.set(key, binding);
             this.unbindOthersForChat(channelId, kind, chatId, sessionId);
+            this.registerToolsFor(binding.handle?.agent?.ctx, binding.handle?.agent, channelId);
         });
     }
     setTitle(sessionId, title, source) {
@@ -534,6 +573,7 @@ export class SessionRouter {
             const result = await controller.resolveAgent(record.sessionId);
             if (!result.agent)
                 return undefined;
+            this.registerToolsFor(result.agent.ctx, result.agent, record.channel);
             return { key: sessionKeyOf(record.channel, record.kind, record.chatId), channelId: record.channel, kind: record.kind, chatId: record.chatId,
                 sessionId: record.sessionId, handle: { agent: result.agent, dispose: async () => { } } };
         }
@@ -549,6 +589,7 @@ export class SessionRouter {
                 sessionId: record.sessionId,
             };
             await this.attachWorkspace(record.sessionId, record.channel, record.cwd);
+            this.registerToolsFor(liveAgent.ctx, liveAgent, record.channel);
             return binding;
         }
         if (!this.ctx.agents?.resume)
@@ -754,6 +795,7 @@ export class SessionRouter {
                     this.log(`[router] 无法应用权限 ${permission}: ${error instanceof Error ? error.message : String(error)}`);
                 }
             }
+            this.registerToolsFor(agentCtx, agent, channelId);
         };
     }
 }

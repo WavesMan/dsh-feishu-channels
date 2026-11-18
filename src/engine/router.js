@@ -482,6 +482,50 @@ export class SessionRouter {
         this.log(`[router] 新建 IM 会话 ${sessionId}`);
         return binding;
     }
+    /**
+     * Apply the channel's current model to an existing live or resumed Agent.
+     * The host owns the mutable selection used for the next request; using its
+     * controller avoids rewriting the global default model as selectModel() does.
+     */
+    applyConfiguredModel(channelId, agent) {
+        if (!agent)
+            return false;
+        const config = this.resolveConfig(channelId);
+        if (!config?.provider || !config?.model)
+            return false;
+        const selected = {
+            provider: config.provider,
+            model: config.model,
+            ...(config.reasoningEffort === undefined ? {} : { reasoningEffort: config.reasoningEffort }),
+        };
+        const controller = this.ctx.get?.('sessionController');
+        const agents = controller?.agents;
+        try {
+            if (agents && typeof agents.selectForNextRequest === 'function') {
+                const current = agents.selectionFor?.(agent)?.current;
+                if (current?.provider === selected.provider
+                    && current?.model === selected.model
+                    && (current.reasoningEffort ?? undefined) === (selected.reasoningEffort ?? undefined))
+                    return true;
+                agents.selectForNextRequest(agent, selected);
+                this.log(`[router] ${channelId} 下一轮模型切换为 ${selected.provider}/${selected.model}`);
+                return true;
+            }
+            if (agent.session?.append) {
+                agent.session.append('model/selection', selected);
+                const selection = agents?.selectionFor?.(agent);
+                if (selection)
+                    selection.current = selected;
+                this.log(`[router] ${channelId} 已记录下一轮模型 ${selected.provider}/${selected.model}`);
+                return true;
+            }
+        }
+        catch (error) {
+            this.log(`[router] 更新频道模型失败 ${channelId}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        return false;
+    }
+
     async resume(record) {
         if (record.adopted) {
             const controller = this.ctx.get?.('sessionController');
@@ -496,6 +540,7 @@ export class SessionRouter {
         const liveAgent = this.ctx.agents?.get?.(record.sessionId);
         if (liveAgent) {
             await this.syncStoredTitle(record.sessionId, liveAgent);
+            this.applyConfiguredModel(record.channel, liveAgent);
             const binding = {
                 key: sessionKeyOf(record.channel, record.kind, record.chatId),
                 channelId: record.channel,
@@ -518,6 +563,7 @@ export class SessionRouter {
                 setup: this.presetSetup(record.channel, record.agentPreset, true),
             });
             await this.syncStoredTitle(record.sessionId, handle.agent);
+            this.applyConfiguredModel(record.channel, handle.agent);
             await this.attachWorkspace(record.sessionId, record.channel, record.cwd);
             return {
                 key: sessionKeyOf(record.channel, record.kind, record.chatId),

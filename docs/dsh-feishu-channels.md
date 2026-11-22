@@ -121,6 +121,7 @@ src/index.js
 - 私聊准入和群聊 @ 规则；
 - 消息来源合并与按来源分块提交；
 - 附件工作区落盘、历史附件下载工具与消息上下文读取工具；
+- 应用身份读取多维表格与任务，供 Agent 整理工作规划；
 - 显式文件交付：图片走图片消息，普通文件走文件消息，同一回合去重；
 - 会话标题、历史恢复和工作区挂载。
 
@@ -364,7 +365,28 @@ Agent 会话按宿主契约注册以下工具（作用域绑定到当前 Agent�
 
 读取范围绑定当前频道、聊天与触发请求：模型不能指定其他聊天，附件 ID 必须来自当前请求可访问的消息清单。工具结果直接在本次调用中返回，不会重新提交用户消息。
 
-### 6.5 访问控制与命令
+### 6.5 工作数据读取
+
+Agent 还可以用应用身份读取多维表格与飞书任务，用于汇总进度、整理待办和制定计划：
+
+| 工具 | 作用 |
+|---|---|
+| `feishu_bitable_overview` | 解析 Base 链接或 `app_token`，返回应用信息与数据表列表 |
+| `feishu_bitable_fields` | 列出字段名称、类型与选项，供构造筛选条件 |
+| `feishu_bitable_records` | 按字段、视图、筛选、排序和分页读取记录，只读 |
+| `feishu_task_list` | 列出应用身份可读取的任务 |
+| `feishu_task_get` | 读取单个任务详情 |
+| `feishu_tasklist_list` | 列出应用身份可读取的任务清单 |
+| `feishu_tasklist_tasks` | 列出任务清单中的任务 |
+
+边界：
+
+- 全部使用 `tenant_access_token`，不使用用户 token，也不做用户 OAuth。
+- 多维表格读取要求应用已被添加为具体 Base 的协作者；应用 scope 本身不授予文档权限。
+- 任务接口按调用身份返回可见数据。应用身份通常只能看到应用参与或被共享的任务/清单；个人任务中心的数据不在当前版本范围内。
+- 工具会收敛筛选字段、操作符、排序字段、分页大小和返回文本长度；只记录资源 ID 与状态码，不把表格内容或任务正文写进日志。
+
+### 6.6 访问控制与命令
 
 - 私聊准入支持 `approved` 和 `all`；
 - 首个用户/owner 会加入允许列表；
@@ -391,8 +413,13 @@ Agent 会话按宿主契约注册以下工具（作用域绑定到当前 Agent�
 | `im:message:readonly` | tenant | 读取引用与单条消息 |
 | `im:message.group_msg` | tenant | 读取群历史消息 |
 | `im:resource` | tenant | 下载消息中的图片与文件 |
+| `bitable:app:readonly` | tenant | 读取已授权的多维表格 |
+| `task:task:readonly` | tenant | 读取应用可见的任务 |
+| `task:tasklist:readonly` | tenant | 读取应用可见的任务清单 |
 | `im:message.send_as_user` | user | 以用户身份发送消息 |
 | `application:application:patch` | tenant | 写入应用配置（名称、重定向 URL 等） |
+
+多维表格还需要把应用加为具体 Base 的协作者（文档级权限），这一步不能由应用 scope 代替；任务/清单也需要与应用共享。provisioning 只负责申请应用级 scope 并核对结果。
 
 扫码完成后，`provisionFeishuApp()` 会尽力执行：
 

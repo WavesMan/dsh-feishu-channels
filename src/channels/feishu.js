@@ -207,6 +207,87 @@ export function createFeishuChannel(id, config, log, loadSdk) {
         scope.throwIfAborted();
         return readResource(client, { messageId: attachment.sourceMessageId, fileKey: key, type: attachment.kind === 'image' ? 'image' : 'file' }, scope, limit);
     }
+    /** 工作数据只读接口共用同一套超时、取消与业务码校验。 */
+    async function requestData(operation, stage, signal) {
+        if (!client)
+            throw new Error(`${id}: 尚未连接`);
+        const scope = AbortSignal.any([timeoutSignal(30_000, lifecycle?.signal), ...(signal ? [signal] : [])]);
+        scope.throwIfAborted();
+        const result = await fileOperation(operation(), scope);
+        assertResult(result, stage);
+        return result?.data ?? {};
+    }
+    function pageOf(data) {
+        return {
+            items: Array.isArray(data?.items) ? data.items : [],
+            hasMore: data?.has_more === true || data?.has_more === 1,
+            pageToken: typeof data?.page_token === 'string' ? data.page_token : '',
+        };
+    }
+    /** 应用身份读取多维表格；文档权限由飞书 Base 协作者设置决定。 */
+    async function bitableGet(appToken, signal) {
+        const data = await requestData(() => client.bitable.app.get({ path: { app_token: appToken } }), 'bitable-app', signal);
+        return data?.app ?? data;
+    }
+    async function bitableListTables(appToken, { pageSize = 50, pageToken } = {}, signal) {
+        const data = await requestData(() => client.bitable.appTable.list({ path: { app_token: appToken }, params: {
+                page_size: pageSize,
+                ...(pageToken ? { page_token: pageToken } : {}),
+            } }), 'bitable-tables', signal);
+        return pageOf(data);
+    }
+    async function bitableListFields(appToken, tableId, { viewId, pageSize = 50, pageToken } = {}, signal) {
+        const data = await requestData(() => client.bitable.appTableField.list({ path: { app_token: appToken, table_id: tableId }, params: {
+                ...(viewId ? { view_id: viewId } : {}),
+                page_size: pageSize,
+                ...(pageToken ? { page_token: pageToken } : {}),
+            } }), 'bitable-fields', signal);
+        return pageOf(data);
+    }
+    async function bitableSearchRecords(appToken, tableId, { viewId, fieldNames, filter, sort, pageSize = 50, pageToken } = {}, signal) {
+        const data = await requestData(() => client.bitable.appTableRecord.search({ path: { app_token: appToken, table_id: tableId }, params: {
+                user_id_type: 'open_id',
+                page_size: pageSize,
+                ...(pageToken ? { page_token: pageToken } : {}),
+            }, data: {
+                ...(viewId ? { view_id: viewId } : {}),
+                ...(fieldNames?.length ? { field_names: fieldNames } : {}),
+                ...(filter ? { filter } : {}),
+                ...(sort?.length ? { sort } : {}),
+            } }), 'bitable-records', signal);
+        return { ...pageOf(data), ...(Number.isSafeInteger(data?.total) ? { total: data.total } : {}) };
+    }
+    /** 任务接口按调用身份返回可见数据；应用身份不会获得用户个人任务。 */
+    async function taskList({ completed, pageSize = 50, pageToken } = {}, signal) {
+        const data = await requestData(() => client.task.v2.task.list({ params: {
+                user_id_type: 'open_id',
+                page_size: pageSize,
+                page_token: pageToken,
+                ...(typeof completed === 'boolean' ? { completed } : {}),
+            } }), 'task-list', signal);
+        return pageOf(data);
+    }
+    async function taskGet(taskGuid, signal) {
+        const data = await requestData(() => client.task.v2.task.get({ path: { task_guid: taskGuid }, params: { user_id_type: 'open_id' } }), 'task-get', signal);
+        return data?.task;
+    }
+    async function tasklistList({ pageSize = 50, pageToken } = {}, signal) {
+        const data = await requestData(() => client.task.v2.tasklist.list({ params: {
+                user_id_type: 'open_id',
+                page_size: pageSize,
+                page_token: pageToken,
+            } }), 'tasklist-list', signal);
+        return pageOf(data);
+    }
+    async function tasklistTasks(tasklistGuid, { completed, pageSize = 50, pageToken } = {}, signal) {
+        const data = await requestData(() => client.task.v2.tasklist.tasks({ path: { tasklist_guid: tasklistGuid }, params: {
+                user_id_type: 'open_id',
+                page_size: pageSize,
+                page_token: pageToken,
+                ...(typeof completed === 'boolean' ? { completed } : {}),
+            } }), 'tasklist-tasks', signal);
+        return pageOf(data);
+    }
     function sendPayload(chatId, target, payload, sender = client) {
         if (!sender)
             throw new Error(`${id}: 尚未连接`);
@@ -457,6 +538,14 @@ export function createFeishuChannel(id, config, log, loadSdk) {
         readMessage,
         listMessages,
         downloadAttachment,
+        bitableGet,
+        bitableListTables,
+        bitableListFields,
+        bitableSearchRecords,
+        taskList,
+        taskGet,
+        tasklistList,
+        tasklistTasks,
         async sendChoices(message, text, buttons) {
             if (!client)
                 throw new Error('channel-unavailable');
@@ -535,7 +624,7 @@ export function createFeishuChannel(id, config, log, loadSdk) {
                     throw error;
                 }
                 const present = new Set((data?.data?.app?.scopes ?? data?.app?.scopes ?? []).map(item => String(item?.scope ?? '')).filter(Boolean));
-                for (const scope of ['im:message:readonly', 'im:message.group_msg', 'im:resource']) {
+                for (const scope of ['im:message:readonly', 'im:message.group_msg', 'im:resource', 'bitable:app:readonly', 'task:task:readonly', 'task:tasklist:readonly']) {
                     if (!present.has(scope))
                         throw new DiagnosticError('permission');
                 }

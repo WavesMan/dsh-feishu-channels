@@ -67,7 +67,17 @@ test('注册上下文与附件下载工具；宿主有 present 时不重复提�
   t.after(() => engine.dispose())
   const withPresent = toolsHarness(true)
   engine.registerAgentTools({ tools: withPresent.tools }, agentFor(withPresent.tools), 'feishu')
-  assert.deepEqual([...withPresent.registered.keys()].sort(), ['feishu_download_attachment', 'feishu_read_context'])
+  assert.deepEqual([...withPresent.registered.keys()].sort(), [
+    'feishu_bitable_fields',
+    'feishu_bitable_overview',
+    'feishu_bitable_records',
+    'feishu_download_attachment',
+    'feishu_read_context',
+    'feishu_task_get',
+    'feishu_task_list',
+    'feishu_tasklist_list',
+    'feishu_tasklist_tasks',
+  ])
   const withoutPresent = toolsHarness(false)
   const agent = agentFor(withoutPresent.tools)
   agent.session = { id: 'dfc:feishu:dm:2:oc_1' }

@@ -6,6 +6,7 @@ import { readDeliveryHistory } from './delivery-history.js';
 import { AttachmentSaveError, AttachmentStore, MAX_ATTACHMENT_BYTES } from './attachment-store.js';
 import { attachmentFailureLabel } from './file-input.js';
 import { composeSubmission, deliveryTargetOf } from './feishu-submission.js';
+import { createFeishuWorkTools } from './feishu-work-tools.js';
 import { ChoiceStore } from './choices.js';
 import { MessageProgress, ProgressTracker } from './message-progress.js';
 import { notice, replyText, withReplyLocale } from './command-locale.js';
@@ -819,6 +820,12 @@ export class ImEngine {
         };
         register(this.readContextTool(channelId, sessionId));
         register(this.downloadAttachmentTool(channelId, sessionId));
+        for (const definition of createFeishuWorkTools({
+            channelId,
+            resolveChannel: () => this.channels.get(channelId),
+            log: this.log,
+        }))
+            register(definition);
         let hasPresent = false;
         try {
             hasPresent = !!tools.get('present');
